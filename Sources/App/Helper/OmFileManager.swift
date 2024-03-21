@@ -4,36 +4,69 @@ import NIOConcurrencyHelpers
 import Vapor
 import NIO
 
-/// Represents an om file that can be cached for file accesses.
-protocol OmFileManagerReadable: Hashable {
-    /// Will only be called if the file path needs to be assembled
-    func getFilePath() -> String
+enum OmFileManagerType: String {
+    case chunk
+    case year
+    case master
+    case linear_bias_seasonal
 }
 
-/// Simple base path, variable name and timechunk
-struct OmFilePathWithTime: OmFileManagerReadable {
-    let basePath: String
-    let variable: String
-    let timeChunk: Int
+enum OmFileManagerReadable: Hashable {
+    case domainChunk(domain: DomainRegistry, variable: String, type: OmFileManagerType, chunk: Int?, ensembleMember: Int, previousDay: Int)
+    case staticFile(domain: DomainRegistry, variable: String, chunk: Int? = nil)
     
+    /// Assemble the full file system path
     func getFilePath() -> String {
-        return basePath + variable + "_\(timeChunk).om"
+        return "\(OpenMeteo.dataDirectory)\(getRelativeFilePath())"
     }
-}
-
-/// Assemble a file path if required. Includes data directory as a prefix.
-/// All input paths can be passed by reference and do not require to allocate new strings unless required
-struct OmFilePathWithSuffix: OmFileManagerReadable {
-    let domain: String
-    let directory: String
-    let variable: String
-    let suffix: String
     
-    func getFilePath() -> String {
-        return "\(OpenMeteo.dataDictionary)\(directory)-\(domain)/\(variable)_\(suffix).om"
+    private func getRelativeFilePath() -> String {
+        switch self {
+        case .domainChunk(let domain, let variable, let type, let chunk, let ensembleMember, let previousDay):
+            let ensembleMember = ensembleMember > 0 ? "_member\(ensembleMember.zeroPadded(len: 2))" : ""
+            let previousDay = previousDay > 0 ? "_previous_day\(previousDay)" : ""
+            if let chunk {
+                return "\(domain.rawValue)/\(variable)\(previousDay)\(ensembleMember)/\(type)_\(chunk).om"
+            }
+            return "\(domain.rawValue)/\(variable)\(previousDay)\(ensembleMember)/\(type).om"
+        case .staticFile(let domain, let variable, let chunk):
+            if let chunk {
+                // E.g. DEM model '/copernicus_dem90/static/lat_-1.om'
+                return "\(domain.rawValue)/static/\(variable)_\(chunk).om"
+            }
+            return "\(domain.rawValue)/static/\(variable).om"
+        }
     }
-    func createDirectory() throws {
-        try FileManager.default.createDirectory(atPath: "\(OpenMeteo.dataDictionary)\(directory)-\(domain)", withIntermediateDirectories: true)
+    
+    func createDirectory(dataDirectory: String = OpenMeteo.dataDirectory) throws {
+        let file = getRelativeFilePath()
+        guard let last = file.lastIndex(of: "/") else {
+            return
+        }
+        let path = "\(dataDirectory)\(file[file.startIndex..<last])"
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+    }
+    
+    func openRead() throws -> OmFileReader<MmapFile>? {
+        let file = getFilePath()
+        guard FileManager.default.fileExists(atPath: file) else {
+            return nil
+        }
+        return try OmFileReader(file: file)
+    }
+    
+    func openReadCached() throws -> OmFileReader<MmapFileCached>? {
+        let fileRel = getRelativeFilePath()
+        let file = "\(OpenMeteo.dataDirectory)\(fileRel)"
+        guard FileManager.default.fileExists(atPath: file) else {
+            return nil
+        }
+        if let cacheDir = OpenMeteo.cacheDirectory {
+            let cacheFile = "\(cacheDir)\(fileRel)"
+            try createDirectory(dataDirectory: cacheDir)
+            return try OmFileReader(file: file, cacheFile: cacheFile)
+        }
+        return try OmFileReader(file: file, cacheFile: nil)
     }
 }
 
@@ -42,16 +75,14 @@ struct OmFilePathWithSuffix: OmFileManagerReadable {
 final class OmFileManager: LifecycleHandler {
     /// A file might exist and is open, or it is missing
     enum OmFileState {
-        case exists(file: OmFileReader<MmapFile>)
+        case exists(file: OmFileReader<MmapFileCached>)
         case missing(path: String)
     }
     
     /// Non existing files are set to nil
-    private var cached = [Int: OmFileState]()
+    private let cached = NIOLockedValueBox<[Int: OmFileState]>(.init())
     
-    private let lock = NIOLock()
-    
-    private var backgroundWatcher: RepeatedTask?
+    private let backgroundWatcher = NIOLockedValueBox<Task<(), Error>?>(nil)
     
     public static var instance = OmFileManager()
     
@@ -60,59 +91,91 @@ final class OmFileManager: LifecycleHandler {
     func didBoot(_ application: Application) throws {
         //let logger = application.logger
         //logger.debug("Starting OmFileManager")
-        backgroundWatcher = application.eventLoopGroup.next().scheduleRepeatedTask(initialDelay: .seconds(2), delay: .seconds(2), {
-            task in
-            
-            // Could be later used to expose some metrics
-            var countExisting = 0
-            var countMissing = 0
-            var countEjected = 0
-            
-            let copy = self.lock.withLock {
-                return self.cached
-            }
-            
-            for e in copy {
-                switch e.value {
-                case .exists(file: let file):
-                    // Remove file from cache, if it was deleted
-                    if file.wasDeleted() {
-                        self.lock.withLock {
-                            let _ = self.cached.removeValue(forKey: e.key)
-                            countEjected += 1
-                        }
+        let logger = application.logger
+        backgroundWatcher.withLockedValue({
+            $0 = Task {
+                var count: Double = 0
+                var elapsed: Double = 0
+                var max: Double = 0
+                while true {
+                    let start = DispatchTime.now()
+                    let stats = self.secondlyCallback()
+                    let dt = Double((DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds)) / 1_000_000_000
+                    if dt > max {
+                        max = dt
                     }
-                    countExisting += 1
-                case .missing(path: let path):
-                    // Remove file from cache, if it is now available, so the next open, will make it available
-                    if FileManager.default.fileExists(atPath: path) {
-                        self.lock.withLock {
-                            let _ = self.cached.removeValue(forKey: e.key)
-                            countEjected += 1
+                    elapsed += dt
+                    count += 1
+                    if count >= 10 {
+                        if (stats.open > 0) {
+                            let buf = OmFileReader<MmapFile>.getStatistics()
+                            logger.info("OmFileManager checked \(stats.open) open files and \(stats.missing) missing files. Time average=\((elapsed/count).asSecondsPrettyPrint) max=\(max.asSecondsPrettyPrint). Buffers \(buf.count) total=\(buf.totalSize.bytesHumanReadable) max=\(buf.maxSize.bytesHumanReadable)")
                         }
+                        count = 0
+                        elapsed = 0
+                        max = 0
                     }
-                    countMissing += 1
+                    try Task.checkCancellation()
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                    try Task.checkCancellation()
                 }
             }
-            
-            //logger.info("OmFileManager tracking \(countExisting) open files, \(countMissing) missing files. \(countEjected) were ejected in this update.")
         })
     }
     
+    /// Called every couple of seconds to check for any file modifications
+    func secondlyCallback() -> (open: Int, missing: Int, ejected: Int) {
+        // Could be later used to expose some metrics
+        var countExisting = 0
+        var countMissing = 0
+        var countEjected = 0
+        
+        let copy = cached.withLockedValue {
+            return $0
+        }
+        
+        for e in copy {
+            switch e.value {
+            case .exists(file: let file):
+                // Remove file from cache, if it was deleted
+                if file.wasDeleted() {
+                    cached.withLockedValue({
+                        $0.removeValue(forKey: e.key)
+                        countEjected += 1
+                    })
+                }
+                countExisting += 1
+            case .missing(path: let path):
+                // Remove file from cache, if it is now available, so the next open, will make it available
+                if FileManager.default.fileExists(atPath: path) {
+                    cached.withLockedValue({
+                        let _ = $0.removeValue(forKey: e.key)
+                        countEjected += 1
+                    })
+                }
+                countMissing += 1
+            }
+        }
+        return (countExisting, countMissing, countEjected)
+        //logger.info("OmFileManager tracking \(countExisting) open files, \(countMissing) missing files. \(countEjected) were ejected in this update.")
+    }
+    
     func shutdown(_ application: Application) {
-        backgroundWatcher?.cancel()
+        backgroundWatcher.withLockedValue {
+            $0?.cancel()
+        }
     }
     
     /// Get cached file or return nil, if the files does not exist
-    public static func get<File: OmFileManagerReadable>(_ file: File) throws -> OmFileReader<MmapFile>? {
+    public static func get(_ file: OmFileManagerReadable) throws -> OmFileReader<MmapFileCached>? {
         try instance.get(file)
     }
 
     /// Get cached file or return nil, if the files does not exist
-    public func get<File: OmFileManagerReadable>(_ file: File) throws -> OmFileReader<MmapFile>? {
+    public func get(_ file: OmFileManagerReadable) throws -> OmFileReader<MmapFileCached>? {
         let key = file.hashValue
         
-        return try lock.withLock {
+        return try cached.withLockedValue { cached in
             if let file = cached[key] {
                 switch file {
                 case .exists(file: let file):
@@ -121,14 +184,10 @@ final class OmFileManager: LifecycleHandler {
                     return nil
                 }
             }
-            // The actual path name string is interpolated as last as possible. So a cached request, does not have to assemble a path string
-            // This might be a bit over-optimised to just safe string allocations...
-            let path = file.getFilePath()
-            guard FileManager.default.fileExists(atPath: path) else {
-                cached[key] = .missing(path: path)
+            guard let file = try file.openReadCached() else {
+                cached[key] = .missing(path: file.getFilePath())
                 return nil
             }
-            let file = try OmFileReader(file: path)
             cached[key] = .exists(file: file)
             return file
         }
@@ -142,6 +201,15 @@ fileprivate var buffers = [Thread: UnsafeMutableRawBufferPointer]()
 fileprivate let lockBuffers = NIOLock()
 
 extension OmFileReader {
+    /// Basic buffer usage statistics
+    public static func getStatistics() -> (count: Int, totalSize: Int, maxSize: Int) {
+        return lockBuffers.withLock {
+            let total = buffers.reduce(0, {$0 + $1.value.count})
+            let max = buffers .max(by: {$0.value.count > $1.value.count})?.value.count ?? 0
+            return (buffers.count, total, max)
+        }
+    }
+    
     /// Thread safe buffer provider that automatically reallocates buffers
     public static func getBuffer(minBytes: Int) -> UnsafeMutableRawBufferPointer {
         return lockBuffers.withLock {

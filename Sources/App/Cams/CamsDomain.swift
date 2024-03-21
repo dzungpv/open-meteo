@@ -28,20 +28,24 @@ enum CamsDomain: String, GenericDomain, CaseIterable {
         }
     }
     
-    func getStaticFile(type: ReaderStaticVariable) -> OmFileReader<MmapFile>? {
-        return nil
+    var domainRegistry: DomainRegistry {
+        switch self {
+        case .cams_global:
+            return .cams_global
+        case .cams_europe:
+            return .cams_europe
+        }
     }
     
-    var omfileDirectory: String {
-        return "\(OpenMeteo.dataDictionary)omfile-\(rawValue)/"
+    var domainRegistryStatic: DomainRegistry? {
+        return domainRegistry
     }
-    var downloadDirectory: String {
-        return "\(OpenMeteo.dataDictionary)download-\(rawValue)/"
+    
+    var hasYearlyFiles: Bool {
+        return false
     }
-    var omfileArchive: String? {
-        return nil
-    }
-    var omFileMaster: (path: String, time: TimerangeDt)? {
+    
+    var masterTimeRange: Range<Timestamp>? {
         return nil
     }
     
@@ -83,6 +87,10 @@ enum CamsVariable: String, CaseIterable, GenericVariable, GenericVariableMixable
     case olive_pollen
     case ragweed_pollen
     
+    var storePreviousForecast: Bool {
+        return false
+    }
+    
     var omFileName: (file: String, level: Int) {
         return (rawValue, 0)
     }
@@ -96,46 +104,45 @@ enum CamsVariable: String, CaseIterable, GenericVariable, GenericVariableMixable
     }
     
     var requiresOffsetCorrectionForMixing: Bool {
-        // TODO maybe it needs it
         return false
     }
     
     var unit: SiUnit {
         switch self {
         case .pm10:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .pm2_5:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .dust:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .aerosol_optical_depth:
             return .dimensionless
         case .carbon_monoxide:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .nitrogen_dioxide:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .ammonia:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .ozone:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .sulphur_dioxide:
-            return .microgramsPerQuibicMeter
+            return .microgramsPerCubicMetre
         case .uv_index:
             return .dimensionless
         case .uv_index_clear_sky:
             return .dimensionless
         case .alder_pollen:
-            return .grainsPerQuibicMeter
+            return .grainsPerCubicMetre
         case .birch_pollen:
-            return .grainsPerQuibicMeter
+            return .grainsPerCubicMetre
         case .grass_pollen:
-            return .grainsPerQuibicMeter
+            return .grainsPerCubicMetre
         case .mugwort_pollen:
-            return .grainsPerQuibicMeter
+            return .grainsPerCubicMetre
         case .olive_pollen:
-            return .grainsPerQuibicMeter
+            return .grainsPerCubicMetre
         case .ragweed_pollen:
-            return .grainsPerQuibicMeter
+            return .grainsPerCubicMetre
         }
     }
     

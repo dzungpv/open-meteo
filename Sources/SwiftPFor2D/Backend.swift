@@ -13,6 +13,7 @@ public protocol OmFileReaderBackend {
     var count: Int { get }
     var needsPrefetch: Bool { get }
     func prefetchData(offset: Int, count: Int)
+    func preRead(offset: Int, count: Int)
     
     func withUnsafeBytes<ResultType>(_ body: (UnsafeRawBufferPointer) throws -> ResultType) rethrows -> ResultType
 }
@@ -54,6 +55,14 @@ extension FileHandle: OmFileWriterBackend {
 
 /// Make `FileHandle` work as reader
 extension MmapFile: OmFileReaderBackend {
+    public func prefetchData(offset: Int, count: Int) {
+        self.prefetchData(offset: offset, count: count, advice: .willneed)
+    }
+    
+    public func preRead(offset: Int, count: Int) {
+        
+    }
+    
     public var count: Int {
         return data.count
     }
@@ -69,6 +78,10 @@ extension MmapFile: OmFileReaderBackend {
 
 /// Make `Data` work as reader
 extension DataAsClass: OmFileReaderBackend {
+    public func preRead(offset: Int, count: Int) {
+        
+    }
+    
     public var count: Int {
         return data.count
     }

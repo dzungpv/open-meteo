@@ -3,11 +3,27 @@ import Vapor
 
 struct OpenMeteo {
     /// Data directory with trailing slash
-    static var dataDictionary = {
+    static var dataDirectory = {
         if let dir = Environment.get("DATA_DIRECTORY") {
             return dir
         }
         return  "./data/"
+    }()
+    
+    /// Temporary directory with trailing slash
+    static var tempDirectory = {
+        if let dir = Environment.get("TEMP_DIRECTORY") {
+            return dir
+        }
+        if let dir = Environment.get("DATA_DIRECTORY") {
+            return dir
+        }
+        return  "./data/"
+    }()
+    
+    /// Cache all data access using spare files in this directory
+    static var cacheDirectory = {
+        return Environment.get("CACHE_DIRECTORY")
     }()
 }
 
@@ -29,9 +45,11 @@ extension Application {
             redirectConfiguration: .follow(max: 5, allowCycles: false),
             timeout: .init(connect: .seconds(30), read: .minutes(5)),
             connectionPool: .init(idleTimeout: .minutes(10)))
+        // NCEP server still struggle with H2
+        //configuration.httpVersion = .http1Only
         
         let new = HTTPClient(
-            eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup(numberOfThreads: 1)),
+            eventLoopGroupProvider: .shared(eventLoopGroup),
             configuration: configuration,
             backgroundActivityLogger: logger)
         self.storage.set(HttpClientKey.self, to: new) {
@@ -45,27 +63,38 @@ extension Application {
 public func configure(_ app: Application) throws {
     TimeZone.ReferenceType.default = TimeZone(abbreviation: "GMT")!
     
+    let corsConfiguration = CORSMiddleware.Configuration(
+        allowedOrigin: .all,
+        allowedMethods: [.GET, .POST, /*.PUT,*/ .OPTIONS /*, .DELETE, .PATCH*/],
+        allowedHeaders: [.accept, .authorization, .contentType, .origin, .xRequestedWith, .userAgent, .accessControlAllowOrigin]
+    )
+    app.middleware.use(CORSMiddleware(configuration: corsConfiguration))
+    app.middleware.use(ErrorMiddleware.default(environment: try .detect()))
     app.middleware.use(FileMiddleware(publicDirectory: app.directory.publicDirectory))
 
     app.commands.use(BenchmarkCommand(), as: "benchmark")
-    app.commands.use(DownloadIconCommand(), as: "download")
-    app.commands.use(DownloadIconWaveCommand(), as: "download-iconwave")
-    app.commands.use(DownloadEcmwfCommand(), as: "download-ecmwf")
-    app.commands.use(DownloadEra5Command(), as: "download-era5")
-    app.commands.use(DownloadDemCommand(), as: "download-dem")
-    app.commands.use(DownloadCamsCommand(), as: "download-cams")
-    app.commands.use(MeteoFranceDownload(), as: "download-meteofrance")
+    app.commands.use(MigrationCommand(), as: "migration")
+    app.asyncCommands.use(DownloadIconCommand(), as: "download")
+    app.asyncCommands.use(DownloadCmaCommand(), as: "download-cma")
+    app.asyncCommands.use(DownloadBomCommand(), as: "download-bom")
+    app.asyncCommands.use(DownloadIconWaveCommand(), as: "download-iconwave")
+    app.asyncCommands.use(DownloadEcmwfCommand(), as: "download-ecmwf")
+    app.asyncCommands.use(DownloadEra5Command(), as: "download-era5")
+    app.asyncCommands.use(DownloadDemCommand(), as: "download-dem")
+    app.asyncCommands.use(DownloadCamsCommand(), as: "download-cams")
+    app.asyncCommands.use(MeteoFranceDownload(), as: "download-meteofrance")
+    app.asyncCommands.use(DownloadArpaeCommand(), as: "download-arpae")
     app.commands.use(CronjobCommand(), as: "cronjob")
-    app.commands.use(SeasonalForecastDownload(), as: "download-seasonal-forecast")
-    app.commands.use(GfsDownload(), as: "download-gfs")
-    app.commands.use(JmaDownload(), as: "download-jma")
-    app.commands.use(MetNoDownloader(), as: "download-metno")
-    app.commands.use(GloFasDownloader(), as: "download-glofas")
-    app.commands.use(GemDownload(), as: "download-gem")
-    app.commands.use(DownloadCmipCommand(), as: "download-cmip6")
-    app.commands.use(SatelliteDownloadCommand(), as: "download-satellite")
-    app.commands.use(SyncCommand(), as: "sync")
-    app.commands.use(ExportCommand(), as: "export")
+    app.asyncCommands.use(SeasonalForecastDownload(), as: "download-seasonal-forecast")
+    app.asyncCommands.use(GfsDownload(), as: "download-gfs")
+    app.asyncCommands.use(JmaDownload(), as: "download-jma")
+    app.asyncCommands.use(MetNoDownloader(), as: "download-metno")
+    app.asyncCommands.use(GloFasDownloader(), as: "download-glofas")
+    app.asyncCommands.use(GemDownload(), as: "download-gem")
+    app.asyncCommands.use(DownloadCmipCommand(), as: "download-cmip6")
+    app.asyncCommands.use(SatelliteDownloadCommand(), as: "download-satellite")
+    app.asyncCommands.use(SyncCommand(), as: "sync")
+    app.asyncCommands.use(ExportCommand(), as: "export")
     app.commands.use(ConvertOmCommand(), as: "convert-om")
 
     app.http.server.configuration.hostname = "0.0.0.0"
@@ -78,12 +107,12 @@ public func configure(_ app: Application) throws {
     // Higher backlog value to handle more connections
     app.http.server.configuration.backlog = 4096
 
-    app.logger.logLevel = .debug
+    //app.logger.logLevel = .debug
 
     //app.views.use(.leaf)
     
     app.lifecycle.use(OmFileManager.instance)
-    app.lifecycle.use(RateLimiter.instance)
+    app.lifecycle.use(RateLimiterLifecycle.instance)
 
     // register routes
     try routes(app)

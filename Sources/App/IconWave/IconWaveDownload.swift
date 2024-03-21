@@ -10,7 +10,7 @@ import SwiftPFor2D
  
  All equations: https://library.wmo.int/doc_num.php?explnum_id=10979
  */
-struct DownloadIconWaveCommand: AsyncCommandFix {
+struct DownloadIconWaveCommand: AsyncCommand {
     struct Signature: CommandSignature {
         @Argument(name: "domain")
         var domain: String
@@ -23,6 +23,9 @@ struct DownloadIconWaveCommand: AsyncCommandFix {
         
         @Option(name: "only-variables")
         var onlyVariables: String?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
 
     var help: String {
@@ -48,6 +51,10 @@ struct DownloadIconWaveCommand: AsyncCommandFix {
         let variables = onlyVariables ?? IconWaveVariable.allCases
         try await download(application: context.application, domain: domain, run: date, skipFilesIfExisting: signature.skipExisting, variables: variables)
         try convert(logger: logger, domain: domain, run: date, variables: variables)
+        
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: variables)
+        }
     }
     
     /// Download all timesteps and preliminarily covnert it to compressed files
@@ -57,10 +64,9 @@ struct DownloadIconWaveCommand: AsyncCommandFix {
         let baseUrl = "http://opendata.dwd.de/weather/maritime/wave_models/\(domain.rawValue)/grib/\(run.hour.zeroPadded(len: 2))/"
         let logger = application.logger
         try FileManager.default.createDirectory(atPath: domain.downloadDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
         
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient)
-        let nLocationsPerChunk = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil).nLocationsPerChunk
+        let nLocationsPerChunk = OmFileSplitter(domain).nLocationsPerChunk
         let nx = domain.grid.nx
         let ny = domain.grid.ny
         
@@ -90,7 +96,7 @@ struct DownloadIconWaveCommand: AsyncCommandFix {
                 }
                 
                 /// Create elevation file for sea mask
-                if !FileManager.default.fileExists(atPath: domain.surfaceElevationFileOm) {
+                if !FileManager.default.fileExists(atPath: domain.surfaceElevationFileOm.getFilePath()) {
                     var elevation = grib2d.array.data
                     for i in elevation.indices {
                         /// `NaN` out of domain, `-999` sea grid point
@@ -98,7 +104,7 @@ struct DownloadIconWaveCommand: AsyncCommandFix {
                     }
                     //let data2d = Array2DFastSpace(data: elevation, nLocations: elevation.count, nTime: 1)
                     //try data2d.writeNetcdf(filename: "\(downloadDirectory)elevation.nc", nx: nx, ny: ny)
-                    try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 20, chunk1: 20).write(file: domain.surfaceElevationFileOm, compressionType: .p4nzdec256, scalefactor: 1, all: elevation)
+                    try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 20, chunk1: 20).write(file: domain.surfaceElevationFileOm.getFilePath(), compressionType: .p4nzdec256, scalefactor: 1, all: elevation)
                 }
                 
                 // Save temporarily as compressed om files
@@ -106,14 +112,13 @@ struct DownloadIconWaveCommand: AsyncCommandFix {
                 try writer.write(file: fileDest, compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data)
             }
         }
-        curl.printStatistics()
+        await curl.printStatistics()
     }
     
     /// Process each variable and update time-series optimised files
     func convert(logger: Logger, domain: IconWaveDomain, run: Timestamp, variables: [IconWaveVariable]) throws {        
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
         let nLocations = domain.grid.count
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil)
+        let om = OmFileSplitter(domain)
         let nLocationsPerChunk = om.nLocationsPerChunk
         let nTime = domain.countForecastHours
         let time = TimerangeDt(start: run, nTime: nTime, dtSeconds: domain.dtSeconds)
@@ -133,7 +138,7 @@ struct DownloadIconWaveCommand: AsyncCommandFix {
                 return (hour, reader)
             })
             
-            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, indexTime: time.toIndexTime(), skipFirst: skip, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor) { d0offset in
+            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, time: time, skipFirst: skip, scalefactor: variable.scalefactor, storePreviousForecast: variable.storePreviousForecast) { d0offset in
                 
                 let locationRange = d0offset ..< min(d0offset+nLocationsPerChunk, nLocations)
                 data2d.data.fillWithNaNs()

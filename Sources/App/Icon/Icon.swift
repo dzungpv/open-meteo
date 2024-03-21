@@ -15,13 +15,6 @@ enum IconDomains: String, CaseIterable, GenericDomain {
     case iconEuEps = "icon-eu-eps"
     case iconD2Eps = "icon-d2-eps"
     
-    private static var iconElevataion = try? OmFileReader(file: Self.icon.surfaceElevationFileOm)
-    private static var iconD2Elevataion = try? OmFileReader(file: Self.iconD2.surfaceElevationFileOm)
-    private static var iconEuElevataion = try? OmFileReader(file: Self.iconEu.surfaceElevationFileOm)
-    private static var iconEpsElevataion = try? OmFileReader(file: Self.iconEps.surfaceElevationFileOm)
-    private static var iconD2EpsElevataion = try? OmFileReader(file: Self.iconD2Eps.surfaceElevationFileOm)
-    private static var iconEuEpsElevataion = try? OmFileReader(file: Self.iconEuEps.surfaceElevationFileOm)
-    
     var dtSeconds: Int {
         if self == .iconD2_15min {
             return 3600/4
@@ -29,54 +22,54 @@ enum IconDomains: String, CaseIterable, GenericDomain {
         return 3600
     }
     
-    func getStaticFile(type: ReaderStaticVariable) -> OmFileReader<MmapFile>? {
-        switch type {
-        case .soilType:
-            return nil
-        case .elevation:
-            switch self {
-            case .icon:
-                return Self.iconElevataion
-            case .iconEu:
-                return Self.iconEuElevataion
-            case .iconD2_15min:
-                fallthrough
-            case .iconD2:
-                return Self.iconD2Elevataion
-            case .iconEps:
-                return Self.iconEpsElevataion
-            case .iconEuEps:
-                return Self.iconEuEpsElevataion
-            case .iconD2Eps:
-                return Self.iconD2EpsElevataion
-            }
+    var domainRegistry: DomainRegistry {
+        switch self {
+        case .icon:
+            return .dwd_icon
+        case .iconEu:
+            return .dwd_icon_eu
+        case .iconD2:
+            return .dwd_icon_d2
+        case .iconD2_15min:
+            return .dwd_icon_d2_15min
+        case .iconEps:
+            return .dwd_icon_eps
+        case .iconEuEps:
+            return .dwd_icon_eu_eps
+        case .iconD2Eps:
+            return .dwd_icon_d2_eps
+        }
+    }
+    
+    var domainRegistryStatic: DomainRegistry? {
+        switch self {
+        case .iconD2_15min:
+            return .dwd_icon_d2
+        default:
+            return domainRegistry
         }
     }
 
-    var omfileDirectory: String {
-        return "\(OpenMeteo.dataDictionary)omfile-\(rawValue)/"
-    }
-    var downloadDirectory: String {
-        return "\(OpenMeteo.dataDictionary)download-\(rawValue)/"
-    }
-    var omfileArchive: String? {
-        return nil
-    }
-    var omFileMaster: (path: String, time: TimerangeDt)? {
-        return nil
+    var hasYearlyFiles: Bool {
+        return false
     }
     
-    /// Filename of the surface elevation file
-    var surfaceElevationFileOm: String {
-        "\(omfileDirectory)HSURF.om"
+    var masterTimeRange: Range<Timestamp>? {
+        return nil
     }
     
     /// How many hourly timesteps to keep in each compressed chunk
     var omFileLength: Int {
-        // icon-d2 120
-        // eu 192
-        // global 253
-        nForecastHours(run: 0) + 3*24
+        switch self {
+        case .icon, .iconEps:
+            return 180+1 + 3*24
+        case .iconEu, .iconEuEps:
+            return 120+1 + 3*24
+        case .iconD2, .iconD2Eps:
+            return 48+1 + 3*24
+        case .iconD2_15min:
+            return 48*4 + 3*24
+        }
     }
     
     /// All available pressure levels for the current domain
@@ -96,36 +89,6 @@ enum IconDomains: String, CaseIterable, GenericDomain {
             return [] // 300, 500, 850 only temperature and wind
         case .iconD2Eps:
             return [] // 500, 700, 850, 950, 975, 1000
-        }
-    }
-
-    /// Number  of forecast hours per run
-    func nForecastHours(run: Int) -> Int {
-        switch self {
-        case .iconEps:
-            return 180+1
-        case .icon:
-            if  run == 6 || run == 18 {
-                return 120+1
-            } else {
-                return 180+1
-            }
-        case .iconEuEps:
-            return 120+1
-        case .iconEu:
-            if run % 6 == 0 {
-                // full runs
-                return 120+1
-            } else {
-                // ICON-EU sideruns at 3,9,15,21 have 31x 1-hourly values and 3x 6-hourly steps (6 hourly steps are ignored)
-                return 30+1
-            }
-        case .iconD2_15min:
-            return 48*4
-        case .iconD2Eps:
-            fallthrough
-        case .iconD2:
-            return 48+1
         }
     }
     
@@ -198,10 +161,6 @@ enum IconDomains: String, CaseIterable, GenericDomain {
         case .iconD2_15min: fallthrough
         case .iconD2: return "germany"
         }
-    }
-    
-    var initFileNameOm: String {
-        return "\(omfileDirectory)init.txt"
     }
     
     /// model level standard heights, full levels

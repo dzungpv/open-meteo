@@ -14,7 +14,7 @@ import SwiftEccodes
  set DENABLE_JPG_LIBJASPER to ON
  brew reinstall eccodes --build-from-source
  */
-struct SeasonalForecastDownload: AsyncCommandFix {
+struct SeasonalForecastDownload: AsyncCommand {
     struct Signature: CommandSignature {
         @Argument(name: "domain")
         var domain: String
@@ -27,6 +27,9 @@ struct SeasonalForecastDownload: AsyncCommandFix {
         
         @Option(name: "only-variables")
         var onlyVariables: String?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
 
     var help: String {
@@ -61,17 +64,20 @@ struct SeasonalForecastDownload: AsyncCommandFix {
         case .eccc:
             fatalError()
         }
+        
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: CfsVariable.allCases)
+        }
     }
     
     /// download cfs domain
     func downloadCfsElevation(application: Application, domain: SeasonalForecastDomain, run: Timestamp) async throws {
         /// download seamask and height
-        if FileManager.default.fileExists(atPath: domain.surfaceElevationFileOm) {
+        let surfaceElevationFileOm = domain.surfaceElevationFileOm.getFilePath()
+        if FileManager.default.fileExists(atPath: surfaceElevationFileOm) {
             return
         }
-        
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
-        
+                
         let url = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/cfs/prod/cfs.\(run.format_YYYYMMdd)/\(run.hour.zeroPadded(len: 2))/6hrly_grib_01/flxf\(run.format_YYYYMMddHH).01.\(run.format_YYYYMMddHH).grb2"
         try await GfsDownload().downloadNcepElevation(application: application, url: [url], surfaceElevationFileOm: domain.surfaceElevationFileOm, grid: domain.grid, isGlobal: true)
     }
@@ -81,11 +87,13 @@ struct SeasonalForecastDownload: AsyncCommandFix {
         try FileManager.default.createDirectory(atPath: domain.downloadDirectory, withIntermediateDirectories: true)
         
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient, deadLineHours: 18, readTimeout: 20*60)
+        Process.alarm(seconds: Int(18 + 1) * 3600)
+        defer { Process.alarm(seconds: 0) }
         
         let gribVariables = ["tmp2m", "tmin", "soilt1", "dswsfc", "cprat", "q2m", "wnd10m", "tcdcclm", "prate", "soilm3", "pressfc", "soilm2", "soilm1", "soilm4", "tmax"]
         
         for gribVariable in gribVariables {
-            logger.info("Downloading varibale \(gribVariable)")
+            logger.info("Downloading variable \(gribVariable)")
             for member in 1..<domain.nMembers+1 {
                 // https://nomads.ncep.noaa.gov/pub/data/nccf/com/cfs/prod/cfs.20220808/18/time_grib_01/tmin.01.2022080818.daily.grb2.idx
                 let url = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/cfs/prod/cfs.\(run.format_YYYYMMdd)/\(run.hour.zeroPadded(len: 2))/time_grib_\(member.zeroPadded(len: 2))/\(gribVariable).\(member.zeroPadded(len: 2)).\(run.format_YYYYMMddHH).daily.grb2"
@@ -98,13 +106,12 @@ struct SeasonalForecastDownload: AsyncCommandFix {
                 try await curl.download(url: url, toFile: fileDest, bzip2Decode: false)
             }
         }
-        curl.printStatistics()
+        await curl.printStatistics()
     }
     
     /// Process each variable and update time-series optimised files
     func convertCfs(logger: Logger, domain: SeasonalForecastDomain, run: Timestamp) throws {
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil)
+        let om = OmFileSplitter(domain)
         
         for member in 1..<domain.nMembers+1 {
             try GribFile.readAndConvert(logger: logger, gribName: "tmin", member: member, domain: domain, add: -273.15).first!.value
@@ -124,7 +131,7 @@ struct SeasonalForecastDownload: AsyncCommandFix {
                     .writeCfs(om: om, logger: logger, variable: .precipitation, member: member, run: run, dtSeconds: domain.dtSeconds)
             
             try GribFile.readAndConvert(logger: logger, gribName: "tcdcclm", member: member, domain: domain).first!.value
-                    .writeCfs(om: om, logger: logger, variable: .cloudcover, member: member, run: run, dtSeconds: domain.dtSeconds)
+                    .writeCfs(om: om, logger: logger, variable: .cloud_cover, member: member, run: run, dtSeconds: domain.dtSeconds)
 
             try GribFile.readAndConvert(logger: logger, gribName: "soilm1", member: member, domain: domain).first!.value
                     .writeCfs(om: om, logger: logger, variable: .soil_moisture_0_to_10cm, member: member, run: run, dtSeconds: domain.dtSeconds)
@@ -159,7 +166,7 @@ struct SeasonalForecastDownload: AsyncCommandFix {
                 let specificHumidity = try GribFile.readAndConvert(logger: logger, gribName: "q2m", member: member, domain: domain, multiply: 1000).first!.value
                 
                 let relativeHumidity = Array2DFastTime(data: Meteorology.specificToRelativeHumidity(specificHumidity: specificHumidity.data, temperature: tmp2m.data, pressure: surfacePressure.data), nLocations: tmp2m.nLocations, nTime: tmp2m.nTime)
-                try relativeHumidity.writeCfs(om: om, logger: logger, variable: .relativehumidity_2m, member: member, run: run, dtSeconds: domain.dtSeconds)
+                try relativeHumidity.writeCfs(om: om, logger: logger, variable: .relative_humidity_2m, member: member, run: run, dtSeconds: domain.dtSeconds)
             }()
             
             
@@ -184,10 +191,9 @@ struct SeasonalForecastDownload: AsyncCommandFix {
 fileprivate extension Array2DFastTime {
     func writeCfs(om: OmFileSplitter, logger: Logger, variable: CfsVariable, member: Int, run: Timestamp, dtSeconds: Int) throws {
         let startOm = DispatchTime.now()
-        let timeIndexStart = run.timeIntervalSince1970 / dtSeconds
-        let timeIndices = timeIndexStart ..< timeIndexStart + nTime
+        let time = TimerangeDt(start: run, nTime: nTime, dtSeconds: dtSeconds)
         
-        try om.updateFromTimeOriented(variable: "\(variable.rawValue)_\(member)", array2d: self, indexTime: timeIndices, skipFirst: 1, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor)
+        try om.updateFromTimeOriented(variable: "\(variable.rawValue)_member\(member)", array2d: self, time: time, skipFirst: 1, scalefactor: variable.scalefactor, storePreviousForecast: variable.storePreviousForecast)
         logger.info("Update om \(variable) finished in \(startOm.timeElapsedPretty())")
     }
 }

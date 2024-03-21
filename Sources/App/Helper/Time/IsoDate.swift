@@ -4,7 +4,7 @@ import Foundation
  Simple year, month, day container which is decoded to iso dates `2022-01-01`
  */
 public struct IsoDate: Codable {
-    /// Encoded es integer `20220101`
+    /// Encoded as integer `20220101`
     public let date: Int32
     
     public init(year: Int, month: Int, day: Int) {
@@ -61,13 +61,42 @@ public struct IsoDate: Codable {
         guard str.count == 10, str[4..<5] == "-", str[7..<8] == "-" else {
             throw TimeError.InvalidDateFromat
         }
-        guard let year = Int32(str[0..<4]), let month = Int32(str[5..<7]), let day = Int32(str[8..<11]) else {
+        guard let year = Int32(str[0..<4]), let month = Int32(str[5..<7]), let day = Int32(str[8..<10]) else {
             throw TimeError.InvalidDateFromat
         }
         guard year >= 1900, year <= 2050, month >= 1, month <= 12, day >= 1, day <= 31 else {
             throw TimeError.InvalidDate
         }
         self.date = year * 10000 + month * 100 + day
+    }
+}
+
+extension IsoDate {
+    static func load(commaSeparated: [String]) throws -> [IsoDate] {
+        try commaSeparated.flatMap { s in
+            try s.split(separator: ",").map { date in
+                return try IsoDate.init(fromIsoString: String(date))
+            }
+        }
+    }
+    
+    static func loadRange(start: [String], end: [String]) throws -> [ClosedRange<Timestamp>] {
+        if start.isEmpty, end.isEmpty {
+            return []
+        }
+        let startDate = try load(commaSeparated: start)
+        let endDate = try load(commaSeparated: end)
+        guard startDate.count == endDate.count else {
+            throw ForecastapiError.startAndEndDateCountMustBeTheSame
+        }
+        return try zip(startDate, endDate).map { (startDate, endDate) in
+            let start = startDate.toTimestamp()
+            let includedEnd = endDate.toTimestamp()
+            guard includedEnd.timeIntervalSince1970 >= start.timeIntervalSince1970 else {
+                throw ForecastapiError.enddateMustBeLargerEqualsThanStartdate
+            }
+            return start...includedEnd
+        }
     }
 }
 

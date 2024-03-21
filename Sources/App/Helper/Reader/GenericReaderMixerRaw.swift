@@ -16,7 +16,7 @@ protocol GenericReaderMixerRaw: GenericReaderProtocol {
 protocol GenericReaderMixer: GenericReaderMixerRaw {
     associatedtype Domain: GenericDomain
     
-    static func makeReader(domain: Domain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws -> Reader?
+    static func makeReader(domain: Domain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> Reader?
 }
 
 struct GenericReaderMixerSameDomain<Reader: GenericReaderProtocol>: GenericReaderMixerRaw, GenericReaderProtocol {    
@@ -30,12 +30,12 @@ struct GenericReaderMixerSameDomain<Reader: GenericReaderProtocol>: GenericReade
 }
 
 extension GenericReaderMixer {    
-    public init?(domains: [Domain], lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws {
+    public init?(domains: [Domain], lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws {
         /// Initiaise highest resolution domain first. If `elevation` is NaN, use the elevation of the highest domain,
         var elevation = elevation
         
         let reader: [Reader] = try domains.reversed().compactMap { domain -> (Reader?) in
-            guard let domain = try Self.makeReader(domain: domain, lat: lat, lon: lon, elevation: elevation, mode: mode) else {
+            guard let domain = try Self.makeReader(domain: domain, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options) else {
                 return nil
             }
             if elevation.isNaN {
@@ -68,13 +68,17 @@ extension GenericReaderMixerRaw {
         reader.first!.modelDtSeconds
     }
     
-    func prefetchData(variable: Reader.MixingVar, time: TimerangeDt) throws {
+    func prefetchData(variable: Reader.MixingVar, time: TimerangeDtAndSettings) throws {
         for reader in reader {
+            if time.dtSeconds > reader.modelDtSeconds {
+                /// 15 minutely domain while reading hourly data
+                continue
+            }
             try reader.prefetchData(variable: variable, time: time)
         }
     }
     
-    func prefetchData(variables: [Reader.MixingVar], time: TimerangeDt) throws {
+    func prefetchData(variables: [Reader.MixingVar], time: TimerangeDtAndSettings) throws {
         try variables.forEach { variable in
             try prefetchData(variable: variable, time: time)
         }
@@ -84,13 +88,17 @@ extension GenericReaderMixerRaw {
         return try reader.last?.getStatic(type: type)
     }
     
-    func get(variable: Reader.MixingVar, time: TimerangeDt) throws -> DataAndUnit {
+    func get(variable: Reader.MixingVar, time: TimerangeDtAndSettings) throws -> DataAndUnit {
         // Last reader return highest resolution data. therefore reverse iteration
         // Integrate now lower resolution models
         var data: [Float]? = nil
         var unit: SiUnit? = nil
         if variable.requiresOffsetCorrectionForMixing {
             for r in reader.reversed() {
+                if time.dtSeconds > r.modelDtSeconds {
+                    /// 15 minutely domain while reading hourly data
+                    continue
+                }
                 let d = try r.get(variable: variable, time: time)
                 if data == nil {
                     // first iteration
@@ -106,10 +114,14 @@ extension GenericReaderMixerRaw {
             }
             // undo delta operation
             data?.deltaDecode()
-
+            data?.greater(than: 0)
         } else {
             // default case, just place new data in 1:1
             for r in reader.reversed() {
+                if time.dtSeconds > r.modelDtSeconds {
+                    /// 15 minutely domain while reading hourly data
+                    continue
+                }
                 let d = try r.get(variable: variable, time: time)
                 if data == nil {
                     // first iteration

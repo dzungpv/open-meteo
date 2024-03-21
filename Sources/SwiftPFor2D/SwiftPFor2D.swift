@@ -4,6 +4,7 @@ import Foundation
 
 public enum SwiftPFor2DError: Error {
     case cannotOpenFile(filename: String, errno: Int32, error: String)
+    case cannotTruncateFile(filename: String, errno: Int32, error: String)
     case cannotOpenFile(errno: Int32, error: String)
     case cannotMoveFile(from: String, to: String, errno: Int32, error: String)
     case chunkHasWrongNumberOfElements
@@ -53,11 +54,11 @@ public final class OmFileWriterState<Backend: OmFileWriterBackend> {
     public let scalefactor: Float
     
     /// Buffer where chunks are moved to, before compression them. => input for compression call
-    public var readBuffer: UnsafeMutableRawBufferPointer
+    private var readBuffer: UnsafeMutableRawBufferPointer
     
     /// Compressed chunks are written into this buffer
     /// 1 MB write buffer or larger if chunks are very large
-    public var writeBuffer: UnsafeMutableBufferPointer<UInt8>
+    private var writeBuffer: UnsafeMutableBufferPointer<UInt8>
     
     public var bytesWrittenSinceLastFlush = 0
     
@@ -88,7 +89,7 @@ public final class OmFileWriterState<Backend: OmFileWriterBackend> {
      
      Note: `chunk0` can be a uneven multiple of `dim0`. E.g. for 10 location, we can use chunks of 3, so the last chunk will only cover 1 location.
      */
-    public init(fn: Backend, dim0: Int, dim1: Int, chunk0: Int, chunk1: Int, compression: CompressionType, scalefactor: Float, readBuffer: UnsafeMutableRawBufferPointer, writeBuffer: UnsafeMutableBufferPointer<UInt8>) throws {
+    public init(fn: Backend, dim0: Int, dim1: Int, chunk0: Int, chunk1: Int, compression: CompressionType, scalefactor: Float) throws {
         self.fn = fn
         self.dim0 = dim0
         self.dim1 = dim1
@@ -96,8 +97,6 @@ public final class OmFileWriterState<Backend: OmFileWriterBackend> {
         self.chunk1 = chunk1
         self.compression = compression
         self.scalefactor = scalefactor
-        self.readBuffer = readBuffer
-        self.writeBuffer = writeBuffer
         
         guard chunk0 > 0 && chunk1 > 0 && dim0 > 0 && dim1 > 0 else {
             throw SwiftPFor2DError.dimensionMustBeLargerThan0
@@ -106,7 +105,23 @@ public final class OmFileWriterState<Backend: OmFileWriterBackend> {
             throw SwiftPFor2DError.chunkDimensionIsSmallerThenOverallDim
         }
         
+        let chunkSizeByte = chunk0 * chunk1 * 4
+        if chunkSizeByte > 1024 * 1024 * 4 {
+            print("WARNING: Chunk size greater than 4 MB (\(Float(chunkSizeByte) / 1024 / 1024) MB)!")
+        }
+
+        let bufferSize = P4NENC256_BOUND(n: chunk0*chunk1, bytesPerElement: 4)
+        
+        // Read buffer needs to be a bit larger for AVX 256 bit alignment
+        self.readBuffer = UnsafeMutableRawBufferPointer.allocate(byteCount: bufferSize, alignment: 4)
+        self.writeBuffer = .allocate(capacity: max(1024 * 1024, bufferSize))
+        
         chunkOffsetBytes.reserveCapacity(nChunks)
+    }
+    
+    deinit {
+        readBuffer.deallocate()
+        writeBuffer.deallocate()
     }
     
     public func writeHeader() throws {
@@ -303,34 +318,11 @@ public final class OmFileWriter {
     public let chunk0: Int
     public let chunk1: Int
     
-    var readBuffer: UnsafeMutableRawBufferPointer
-    
-    /// Compressed chunks are written into this buffer
-    /// 8 MB write buffer or larger if chunks are very large
-    var writeBuffer: UnsafeMutableBufferPointer<UInt8>
-    
     public init(dim0: Int, dim1: Int, chunk0: Int, chunk1: Int) {
         self.dim0 = dim0
         self.dim1 = dim1
         self.chunk0 = chunk0
         self.chunk1 = chunk1
-        
-        let chunkSizeByte = chunk0 * chunk1 * 4
-        if chunkSizeByte > 1024 * 1024 * 4 {
-            print("WARNING: Chunk size greater than 4 MB (\(Float(chunkSizeByte) / 1024 / 1024) MB)!")
-        }
-
-        let bufferSize = P4NENC256_BOUND(n: chunk0*chunk1, bytesPerElement: 4)
-        
-        // Read buffer needs to be a bit larger for AVX 256 bit alignment
-        self.readBuffer = UnsafeMutableRawBufferPointer.allocate(byteCount: bufferSize, alignment: 4)
-        
-        self.writeBuffer = .allocate(capacity: max(1024 * 1024 * 8, bufferSize))
-    }
-    
-    deinit {
-        readBuffer.deallocate()
-        writeBuffer.deallocate()
     }
     
     /**
@@ -342,7 +334,7 @@ public final class OmFileWriter {
      */
     public func write<Backend: OmFileWriterBackend>(fn: Backend, compressionType: CompressionType, scalefactor: Float, supplyChunk: (_ dim0Offset: Int) throws -> ArraySlice<Float>) throws {
         
-        let state = try OmFileWriterState<Backend>(fn: fn, dim0: dim0, dim1: dim1, chunk0: chunk0, chunk1: chunk1, compression: compressionType, scalefactor: scalefactor, readBuffer: readBuffer, writeBuffer: writeBuffer)
+        let state = try OmFileWriterState<Backend>(fn: fn, dim0: dim0, dim1: dim1, chunk0: chunk0, chunk1: chunk1, compression: compressionType, scalefactor: scalefactor)
         
         try state.writeHeader()
         while state.c0 < state.nDim0Chunks {
@@ -355,17 +347,17 @@ public final class OmFileWriter {
     /// Write new file. Throw error is file exists
     /// Uses a temporary file and then atomic move
     /// If `overwrite` is set, overwrite existing files atomically
-    public func write(file: String, compressionType: CompressionType, scalefactor: Float, overwrite: Bool, supplyChunk: (_ dim0Offset: Int) throws -> ArraySlice<Float>) throws {
+    @discardableResult
+    public func write(file: String, compressionType: CompressionType, scalefactor: Float, overwrite: Bool, supplyChunk: (_ dim0Offset: Int) throws -> ArraySlice<Float>) throws -> FileHandle {
         if !overwrite && FileManager.default.fileExists(atPath: file) {
             throw SwiftPFor2DError.fileExistsAlready(filename: file)
         }
         let fileTemp = "\(file)~"
         try FileManager.default.removeItemIfExists(at: fileTemp)
-        try {
-            let fn = try FileHandle.createNewFile(file: fileTemp)
-            try write(fn: fn, compressionType: compressionType, scalefactor: scalefactor, supplyChunk: supplyChunk)
-        }()
+        let fn = try FileHandle.createNewFile(file: fileTemp)
+        try write(fn: fn, compressionType: compressionType, scalefactor: scalefactor, supplyChunk: supplyChunk)
         try FileManager.default.moveFileOverwrite(from: fileTemp, to: file)
+        return fn
     }
     
     //public func write(file: String, compressionType: CompressionType, scalefactor: Float, readers: [OmFileR]) throws {
@@ -388,7 +380,8 @@ public final class OmFileWriter {
     
     /// Write all data at once without any streaming
     /// If `overwrite` is set, overwrite existing files atomically
-    public func write(file: String, compressionType: CompressionType, scalefactor: Float, all: [Float], overwrite: Bool = false) throws {
+    @discardableResult
+    public func write(file: String, compressionType: CompressionType, scalefactor: Float, all: [Float], overwrite: Bool = false) throws -> FileHandle {
         try write(file: file, compressionType: compressionType, scalefactor: scalefactor, overwrite: overwrite, supplyChunk: { range in
             return ArraySlice(all)
         })
@@ -458,6 +451,8 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
     public let chunk1: Int
     
     public init(fn: Backend) throws {
+        // Fetch header
+        fn.preRead(offset: 0, count: OmHeader.length)
         let header = fn.withUnsafeBytes {
             $0.baseAddress!.withMemoryRebound(to: OmHeader.self, capacity: 1) { ptr in
                 ptr.pointee
@@ -504,8 +499,14 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
             
             let compressedDataStartOffset = OmHeader.length + nChunks * MemoryLayout<Int>.stride
             
-            for c0 in dim0Read.lowerBound / chunk0 ..< dim0Read.upperBound.divideRoundedUp(divisor: chunk0) {
-                for c1 in dim1Read.lowerBound / chunk1 ..< dim1Read.upperBound.divideRoundedUp(divisor: chunk1) {
+            for c0 in dim0Read.divide(by: chunk0) {
+                let c1Range = dim1Read.divide(by: chunk1)
+                let c1Chunks = c1Range.add(c0 * nDim1Chunks)
+                // pre-read chunk table at specific offset
+                fn.prefetchData(offset: OmHeader.length + max(c1Chunks.lowerBound - 1, 0) * MemoryLayout<Int>.stride, count: c1Range.count * MemoryLayout<Int>.stride)
+                fn.preRead(offset: OmHeader.length + max(c1Chunks.lowerBound - 1, 0) * MemoryLayout<Int>.stride, count: c1Range.count * MemoryLayout<Int>.stride)
+                
+                for c1 in c1Range {
                     // load chunk from mmap
                     let chunkNum = c0 * nDim1Chunks + c1
                     let startPos = chunkNum == 0 ? 0 : chunkOffsets[chunkNum-1]
@@ -558,6 +559,7 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
         
         let nChunks = nDim0Chunks * nDim1Chunks
         fn.withUnsafeBytes { ptr in
+            //fn.preRead(offset: OmHeader.length, count: nChunks * MemoryLayout<Int>.stride)
             let chunkOffsets = ptr.assumingMemoryBound(to: UInt8.self).baseAddress!.advanced(by: OmHeader.length).assumingMemoryBound(to: Int.self, capacity: nChunks)
             
             let compressedDataStartOffset = OmHeader.length + nChunks * MemoryLayout<Int>.stride
@@ -568,8 +570,12 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
                 fallthrough
             case .p4nzdec256:
                 let chunkBuffer = chunkBuffer.assumingMemoryBound(to: Int16.self)
-                for c0 in dim0Read.lowerBound / chunk0 ..< dim0Read.upperBound.divideRoundedUp(divisor: chunk0) {
-                    for c1 in dim1Read.lowerBound / chunk1 ..< dim1Read.upperBound.divideRoundedUp(divisor: chunk1) {
+                for c0 in dim0Read.divide(by: chunk0) {
+                    let c1Range = dim1Read.divide(by: chunk1)
+                    let c1Chunks = c1Range.add(c0 * nDim1Chunks)
+                    // pre-read chunk table at specific offset
+                    fn.preRead(offset: OmHeader.length + max(c1Chunks.lowerBound - 1, 0) * MemoryLayout<Int>.stride, count: c1Range.count * MemoryLayout<Int>.stride)
+                    for c1 in c1Range {
                         // load chunk into buffer
                         // consider the length, even if the last is only partial... E.g. at 1000 elements with 600 chunk length, the last one is only 400
                         let length1 = min((c1+1) * chunk1, dim1) - c1 * chunk1
@@ -585,10 +591,13 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
                         
                         // load chunk from mmap
                         let chunkNum = c0 * nDim1Chunks + c1
+                        precondition(chunkNum < nChunks, "invalid chunkNum")
                         let startPos = chunkNum == 0 ? 0 : chunkOffsets[chunkNum-1]
+                        precondition(compressedDataStartOffset + startPos < ptr.count, "chunk out of range read")
                         let lengthCompressedBytes = chunkOffsets[chunkNum] - startPos
+                        fn.preRead(offset: compressedDataStartOffset + startPos, count: lengthCompressedBytes)
                         let uncompressedBytes = p4nzdec128v16(compressedDataStartPtr.advanced(by: startPos), length0 * length1, chunkBuffer)
-                        precondition(uncompressedBytes == lengthCompressedBytes)
+                        precondition(uncompressedBytes == lengthCompressedBytes, "chunk read bytes mismatch")
                         
                         // 2D delta decoding
                         delta2d_decode(length0, length1, chunkBuffer)
@@ -620,8 +629,8 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
                 let chunkBufferUInt = chunkBuffer.assumingMemoryBound(to: UInt32.self)
                 let chunkBuffer = chunkBuffer.assumingMemoryBound(to: Float.self)
                 
-                for c0 in dim0Read.lowerBound / chunk0 ..< dim0Read.upperBound.divideRoundedUp(divisor: chunk0) {
-                    for c1 in dim1Read.lowerBound / chunk1 ..< dim1Read.upperBound.divideRoundedUp(divisor: chunk1) {
+                for c0 in dim0Read.divide(by: chunk0) {
+                    for c1 in dim1Read.divide(by: chunk1) {
                         // load chunk into buffer
                         // consider the length, even if the last is only partial... E.g. at 1000 elements with 600 chunk length, the last one is only 400
                         let length1 = min((c1+1) * chunk1, dim1) - c1 * chunk1
@@ -639,6 +648,7 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
                         let chunkNum = c0 * nDim1Chunks + c1
                         let startPos = chunkNum == 0 ? 0 : chunkOffsets[chunkNum-1]
                         let lengthCompressedBytes = chunkOffsets[chunkNum] - startPos
+                        fn.preRead(offset: compressedDataStartOffset + startPos, count: lengthCompressedBytes)
                         let uncompressedBytes = fpxdec32(compressedDataStartPtr.advanced(by: startPos), length0 * length1, chunkBufferUInt, 0)
                         precondition(uncompressedBytes == lengthCompressedBytes)
                         
@@ -668,10 +678,53 @@ public final class OmFileReader<Backend: OmFileReaderBackend> {
     }
 }
 
+extension Range where Element == Int {
+    /// Divide lower and upper bound. For upper bound use `divideRoundedUp`
+    func divide(by: Int) -> Range<Int> {
+        return lowerBound / by ..< upperBound.divideRoundedUp(divisor: by)
+    }
+}
+
 extension OmFileReader where Backend == MmapFile {
     public convenience init(file: String) throws {
         let fn = try FileHandle.openFileReading(file: file)
+        try self.init(fn: fn)
+    }
+    
+    public convenience init(fn: FileHandle) throws {
         let mmap = try MmapFile(fn: fn)
+        try self.init(fn: mmap)
+    }
+    
+    /// Check if the file was deleted on the file system. Linux keep the file alive, as long as some processes have it open.
+    public func wasDeleted() -> Bool {
+        fn.wasDeleted()
+    }
+}
+
+extension OmFileReader where Backend == MmapFileCached {
+    public convenience init(file: String, cacheFile: String?) throws {
+        let fn = try FileHandle.openFileReading(file: file)
+        
+        guard let cacheFile else {
+            try self.init(fn: try MmapFileCached(backend: fn, frontend: nil, cacheFile: nil))
+            return
+        }
+        
+        let backendStats = fn.fileSizeAndModificationTime()
+        
+        if let cacheFn = try? FileHandle.openFileReadWrite(file: cacheFile) {
+            let cacheStats = cacheFn.fileSizeAndModificationTime()
+            if cacheStats.size == backendStats.size
+                && cacheStats.modificationTime >= backendStats.modificationTime
+                && cacheStats.creationTime >= backendStats.creationTime {
+                // cache file exists and usable
+                try self.init(fn: MmapFileCached(backend: fn, frontend: cacheFn, cacheFile: cacheFile))
+                return
+            }
+        }
+        let cacheFn = try FileHandle.createNewFile(file: cacheFile, sparseSize: backendStats.size)
+        let mmap = try MmapFileCached(backend: fn, frontend: cacheFn, cacheFile: cacheFile)
         try self.init(fn: mmap)
     }
     

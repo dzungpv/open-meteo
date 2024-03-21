@@ -8,11 +8,11 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
     case wind_v_component_100m
     case wind_u_component_10m
     case wind_v_component_10m
-    case windgusts_10m
-    case dewpoint_2m
-    case cloudcover_low
-    case cloudcover_mid
-    case cloudcover_high
+    case wind_gusts_10m
+    case dew_point_2m
+    case cloud_cover_low
+    case cloud_cover_mid
+    case cloud_cover_high
     case pressure_msl
     case snowfall_water_equivalent
     /// Only ERA5-Land and CERRA have snow depth in ACTUAL height. ERA5 and ECMWF IFS use water equivalent and density
@@ -29,8 +29,16 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
     case precipitation
     case direct_radiation
     
+    case wave_height
+    case wave_direction
+    case wave_period
+    
+    var storePreviousForecast: Bool {
+        return false
+    }
+    
     var isElevationCorrectable: Bool {
-        return self == .temperature_2m || self == .dewpoint_2m ||
+        return self == .temperature_2m || self == .dew_point_2m ||
             self == .soil_temperature_0_to_7cm || self == .soil_temperature_7_to_28cm ||
             self == .soil_temperature_28_to_100cm || self == .soil_temperature_100_to_255cm
     }
@@ -59,7 +67,62 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
     }
     
     var interpolation: ReaderInterpolation {
-        fatalError("Interpolation not required for era5")
+        switch self {
+        case .temperature_2m:
+            return .hermite(bounds: nil)
+        case .wind_u_component_100m:
+            return .hermite(bounds: nil)
+        case .wind_v_component_100m:
+            return .hermite(bounds: nil)
+        case .wind_u_component_10m:
+            return .hermite(bounds: nil)
+        case .wind_v_component_10m:
+            return .hermite(bounds: nil)
+        case .wind_gusts_10m:
+            return .hermite(bounds: nil)
+        case .dew_point_2m:
+            return .hermite(bounds: nil)
+        case .cloud_cover_low:
+            return .hermite(bounds: 0...100)
+        case .cloud_cover_mid:
+            return .hermite(bounds: 0...100)
+        case .cloud_cover_high:
+            return .hermite(bounds: 0...100)
+        case .pressure_msl:
+            return .hermite(bounds: nil)
+        case .snowfall_water_equivalent:
+            return .backwards_sum
+        case .snow_depth:
+            return .linear
+        case .soil_temperature_0_to_7cm:
+            return .hermite(bounds: nil)
+        case .soil_temperature_7_to_28cm:
+            return .hermite(bounds: nil)
+        case .soil_temperature_28_to_100cm:
+            return .hermite(bounds: nil)
+        case .soil_temperature_100_to_255cm:
+            return .hermite(bounds: nil)
+        case .soil_moisture_0_to_7cm:
+            return .hermite(bounds: nil)
+        case .soil_moisture_7_to_28cm:
+            return .hermite(bounds: nil)
+        case .soil_moisture_28_to_100cm:
+            return .hermite(bounds: nil)
+        case .soil_moisture_100_to_255cm:
+            return .hermite(bounds: nil)
+        case .shortwave_radiation:
+            return .solar_backwards_averaged
+        case .precipitation:
+            return .backwards_sum
+        case .direct_radiation:
+            return .solar_backwards_averaged
+        case .wave_height:
+            return .hermite(bounds: nil)
+        case .wave_direction:
+            return .backwards
+        case .wave_period:
+            return .hermite(bounds: nil)
+        }
     }
     
     func availableForDomain(domain: CdsDomain) -> Bool {
@@ -69,12 +132,22 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
             return domain == .era5_land
         }
         
+        // Waves are only available for ERA5 ocean at 0.5° resolution
+        switch self {
+        case .wave_height, .wave_period, .wave_direction:
+            return domain == .era5_ocean
+        default:
+            if domain == .era5_ocean {
+                return false
+            }
+        }
+        
         // Note: ERA5-Land wind, pressure, snowfall, radiation and precipitation are only linearly interpolated from ERA5
         if domain == .era5_land {
             switch self {
             case .temperature_2m:
                 fallthrough
-            case .dewpoint_2m:
+            case .dew_point_2m:
                 fallthrough
             case .soil_temperature_0_to_7cm:
                 fallthrough
@@ -105,12 +178,12 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
         case .wind_v_component_100m: return "100m_v_component_of_wind"
         case .wind_u_component_10m: return "10m_u_component_of_wind"
         case .wind_v_component_10m: return "10m_v_component_of_wind"
-        case .windgusts_10m: return "instantaneous_10m_wind_gust"
-        case .dewpoint_2m: return "2m_dewpoint_temperature"
+        case .wind_gusts_10m: return "instantaneous_10m_wind_gust"
+        case .dew_point_2m: return "2m_dewpoint_temperature"
         case .temperature_2m: return "2m_temperature"
-        case .cloudcover_low: return "low_cloud_cover"
-        case .cloudcover_mid: return "medium_cloud_cover"
-        case .cloudcover_high: return "high_cloud_cover"
+        case .cloud_cover_low: return "low_cloud_cover"
+        case .cloud_cover_mid: return "medium_cloud_cover"
+        case .cloud_cover_high: return "high_cloud_cover"
         case .pressure_msl: return "mean_sea_level_pressure"
         case .snowfall_water_equivalent: return "snowfall"
         case .soil_temperature_0_to_7cm: return "soil_temperature_level_1"
@@ -126,6 +199,9 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
         case .soil_moisture_100_to_255cm: return "volumetric_soil_water_layer_4"
             // NOTE: snow depth uses different definitions in ERA5 and ECMWF IFS. Only ERA5-land returns the actual height directly
         case .snow_depth: return "snow_depth"
+        case .wave_height: return "significant_height_of_combined_wind_waves_and_swell"
+        case .wave_direction: return "mean_wave_direction"
+        case .wave_period: return "mean_wave_period"
         }
     }
     
@@ -141,15 +217,15 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
             return "165.128"
         case .wind_v_component_10m:
             return "166.128"
-        case .windgusts_10m:
+        case .wind_gusts_10m:
             return "49.128"
-        case .dewpoint_2m:
+        case .dew_point_2m:
             return "168.128"
-        case .cloudcover_low:
+        case .cloud_cover_low:
             return "186.128"
-        case .cloudcover_mid:
+        case .cloud_cover_mid:
             return "187.128"
-        case .cloudcover_high:
+        case .cloud_cover_high:
             return "188.128"
         case .pressure_msl:
             return "151.128"
@@ -179,6 +255,12 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
             return "228.128"
         case .direct_radiation:
             return "21.228"
+        case .wave_height:
+            fatalError("Not supported")
+        case .wave_direction:
+            fatalError("Not supported")
+        case .wave_period:
+            fatalError("Not supported")
         }
     }
     
@@ -186,10 +268,10 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
     var netCdfScaling: (offest: Double, scalefactor: Double)? {
         switch self {
         case .temperature_2m: return (-273.15, 1) // kelvin to celsius
-        case .dewpoint_2m: return (-273.15, 1)
-        case .cloudcover_low: return (0, 100) // fraction to percent
-        case .cloudcover_mid: return (0, 100)
-        case .cloudcover_high: return (0, 100)
+        case .dew_point_2m: return (-273.15, 1)
+        case .cloud_cover_low: return (0, 100) // fraction to percent
+        case .cloud_cover_mid: return (0, 100)
+        case .cloud_cover_high: return (0, 100)
         case .pressure_msl: return (0, 1) // keep in Pa (not hPa)
         case .snowfall_water_equivalent: return (0, 1000) // meter to millimeter
         case .soil_temperature_0_to_7cm: return (-273.15, 1) // kelvin to celsius
@@ -206,11 +288,11 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
     /// shortName attribute in GRIB
     var gribShortName: [String] {
         switch self {
-        case .windgusts_10m: return ["10fg", "gust", "i10fg"] // or "gust" on ubuntu 22.04
+        case .wind_gusts_10m: return ["10fg", "gust", "i10fg"] // or "gust" on ubuntu 22.04
         case .temperature_2m: return ["2t"]
-        case .cloudcover_low: return ["lcc"]
-        case .cloudcover_mid: return ["mcc"]
-        case .cloudcover_high: return ["hcc"]
+        case .cloud_cover_low: return ["lcc"]
+        case .cloud_cover_mid: return ["mcc"]
+        case .cloud_cover_high: return ["hcc"]
         case .pressure_msl: return ["msl"]
         case .snowfall_water_equivalent: return ["sf"]
         case .shortwave_radiation: return ["ssrd"]
@@ -220,7 +302,7 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
         case .wind_v_component_100m: return ["100v"]
         case .wind_u_component_10m: return ["10u"]
         case .wind_v_component_10m: return ["10v"]
-        case .dewpoint_2m: return ["2d"]
+        case .dew_point_2m: return ["2d"]
         case .soil_temperature_0_to_7cm: return ["stl1"]
         case .soil_temperature_7_to_28cm: return ["stl2"]
         case .soil_temperature_28_to_100cm: return ["stl3"]
@@ -230,6 +312,12 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
         case .soil_moisture_28_to_100cm: return ["swvl3"]
         case .soil_moisture_100_to_255cm: return ["swvl4"]
         case .snow_depth: return ["sde"]
+        case .wave_height:
+            return ["swh"]
+        case .wave_direction:
+            return ["mwd"]
+        case .wave_period:
+            return ["mwp"]
         }
     }
     
@@ -240,11 +328,11 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
         case .wind_v_component_100m: return 10
         case .wind_u_component_10m: return 10
         case .wind_v_component_10m: return 10
-        case .cloudcover_low: return 1
-        case .cloudcover_mid: return 1
-        case .cloudcover_high: return 1
-        case .windgusts_10m: return 10
-        case .dewpoint_2m: return 20
+        case .cloud_cover_low: return 1
+        case .cloud_cover_mid: return 1
+        case .cloud_cover_high: return 1
+        case .wind_gusts_10m: return 10
+        case .dew_point_2m: return 20
         case .temperature_2m: return 20
         case .pressure_msl: return 0.1
         case .snowfall_water_equivalent: return 10
@@ -260,6 +348,12 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
         case .soil_moisture_28_to_100cm: return 1000
         case .soil_moisture_100_to_255cm: return 1000
         case .snow_depth: return 100 // 1 cm resolution
+        case .wave_height:
+            return 50 // 0.002m resolution
+        case .wave_direction:
+            return 1
+        case .wave_period:
+            return 20 // 0.05s resolution
         }
     }
     
@@ -269,59 +363,81 @@ enum Era5Variable: String, CaseIterable, GenericVariable {
         case .wind_v_component_100m: fallthrough
         case .wind_u_component_10m: fallthrough
         case .wind_v_component_10m: fallthrough
-        case .windgusts_10m: return .ms
-        case .dewpoint_2m: return .celsius
+        case .wind_gusts_10m: return .metrePerSecond
+        case .dew_point_2m: return .celsius
         case .temperature_2m: return .celsius
-        case .cloudcover_low: return .percent
-        case .cloudcover_mid: return .percent
-        case .cloudcover_high: return .percent
+        case .cloud_cover_low: return .percentage
+        case .cloud_cover_mid: return .percentage
+        case .cloud_cover_high: return .percentage
         case .pressure_msl: return .pascal
-        case .snowfall_water_equivalent: return .millimeter
+        case .snowfall_water_equivalent: return .millimetre
         case .soil_temperature_0_to_7cm: return .celsius
         case .soil_temperature_7_to_28cm: return .celsius
         case .soil_temperature_28_to_100cm: return .celsius
         case .soil_temperature_100_to_255cm: return .celsius
-        case .shortwave_radiation: return .wattPerSquareMeter
-        case .precipitation: return .millimeter
-        case .direct_radiation: return .wattPerSquareMeter
-        case .soil_moisture_0_to_7cm: return .qubicMeterPerQubicMeter
-        case .soil_moisture_7_to_28cm: return .qubicMeterPerQubicMeter
-        case .soil_moisture_28_to_100cm: return .qubicMeterPerQubicMeter
-        case .soil_moisture_100_to_255cm: return .qubicMeterPerQubicMeter
-        case .snow_depth: return .meter
+        case .shortwave_radiation: return .wattPerSquareMetre
+        case .precipitation: return .millimetre
+        case .direct_radiation: return .wattPerSquareMetre
+        case .soil_moisture_0_to_7cm: return .cubicMetrePerCubicMetre
+        case .soil_moisture_7_to_28cm: return .cubicMetrePerCubicMetre
+        case .soil_moisture_28_to_100cm: return .cubicMetrePerCubicMetre
+        case .soil_moisture_100_to_255cm: return .cubicMetrePerCubicMetre
+        case .snow_depth: return .metre
+        case .wave_height:
+            return .metre
+        case .wave_direction:
+            return .degreeDirection
+        case .wave_period:
+            return .seconds
         }
     }
 }
 
 struct Era5Factory {
     /// Build a single reader for a given CdsDomain
-    public static func makeReader(domain: CdsDomain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws -> Era5Reader<GenericReaderCached<CdsDomain, Era5Variable>> {
+    public static func makeReader(domain: CdsDomain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> Era5Reader<GenericReaderCached<CdsDomain, Era5Variable>> {
         guard let reader = try GenericReader<CdsDomain, Era5Variable>(domain: domain, lat: lat, lon: lon, elevation: elevation, mode: mode) else {
             // should not be possible
             throw ForecastapiError.noDataAvilableForThisLocation
         }
-        return .init(reader: GenericReaderCached(reader: reader))
+        return .init(reader: GenericReaderCached(reader: reader), options: options)
     }
     
     /**
      Build a combined ERA5 and ERA5-Land reader.
      Derived variables are calculated after combinding both variables to make it possible to calculate ET0 evapotransipiration with temperature from ERA5-Land, but radiation from ERA5
      */
-    public static func makeEra5CombinedLand(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws -> Era5Reader<GenericReaderMixerSameDomain<GenericReaderCached<CdsDomain, Era5Variable>>> {
-        guard let era5 = try GenericReader<CdsDomain, Era5Variable>(domain: .era5, lat: lat, lon: lon, elevation: elevation, mode: mode) else {
+    public static func makeEra5CombinedLand(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> Era5Reader<GenericReaderMixerSameDomain<GenericReaderCached<CdsDomain, Era5Variable>>> {
+        guard /*let era5ocean = try GenericReader<CdsDomain, Era5Variable>(domain: .era5_ocean, lat: lat, lon: lon, elevation: elevation, mode: mode),*/
+              let era5 = try GenericReader<CdsDomain, Era5Variable>(domain: .era5, lat: lat, lon: lon, elevation: elevation, mode: mode),
+              let era5land = try GenericReader<CdsDomain, Era5Variable>(domain: .era5_land, lat: lat, lon: lon, elevation: elevation, mode: mode)
+        else {
             // should not be possible
             throw ForecastapiError.noDataAvilableForThisLocation
         }
-        guard let era5land = try GenericReader<CdsDomain, Era5Variable>(domain: .era5_land, lat: lat, lon: lon, elevation: elevation, mode: mode) else {
+        return .init(reader: GenericReaderMixerSameDomain(reader: [/*GenericReaderCached(reader: era5ocean), */GenericReaderCached(reader: era5), GenericReaderCached(reader: era5land)]), options: options)
+    }
+    
+    public static func makeArchiveBestMatch(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> Era5Reader<GenericReaderMixerSameDomain<GenericReaderCached<CdsDomain, Era5Variable>>> {
+        guard let era5 = try GenericReader<CdsDomain, Era5Variable>(domain: .era5, lat: lat, lon: lon, elevation: elevation, mode: mode),
+              let era5land = try GenericReader<CdsDomain, Era5Variable>(domain: .era5_land, lat: lat, lon: lon, elevation: elevation, mode: mode),
+              let ecmwfIfs = try GenericReader<CdsDomain, Era5Variable>(domain: .ecmwf_ifs, lat: lat, lon: lon, elevation: elevation, mode: mode) 
+        else {
             // should not be possible
             throw ForecastapiError.noDataAvilableForThisLocation
         }
-        return .init(reader: GenericReaderMixerSameDomain(reader: [GenericReaderCached(reader: era5), GenericReaderCached(reader: era5land)]))
+        return .init(reader: GenericReaderMixerSameDomain(reader: [
+            GenericReaderCached(reader: era5),
+            GenericReaderCached(reader: era5land),
+            GenericReaderCached(reader: ecmwfIfs)
+        ]), options: options)
     }
 }
 
 struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, GenericReaderProtocol where Reader.MixingVar == Era5Variable {
-    var reader: Reader
+    let reader: Reader
+    
+    let options: GenericReaderOptions
     
     typealias Domain = CdsDomain
     
@@ -329,11 +445,12 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
     
     typealias Derived = Era5VariableDerived
     
-    public init(reader: Reader) {
+    public init(reader: Reader, options: GenericReaderOptions) {
         self.reader = reader
+        self.options = options
     }
     
-    func prefetchData(variables: [Era5HourlyVariable], time: TimerangeDt) throws {
+    func prefetchData(variables: [Era5HourlyVariable], time: TimerangeDtAndSettings) throws {
         for variable in variables {
             switch variable {
             case .raw(let v):
@@ -344,8 +461,10 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
         }
     }
     
-    func prefetchData(derived: Era5VariableDerived, time: TimerangeDt) throws {
+    func prefetchData(derived: Era5VariableDerived, time: TimerangeDtAndSettings) throws {
         switch derived {
+        case .wind_speed_10m:
+            fallthrough
         case .windspeed_10m:
             try prefetchData(raw: .wind_u_component_10m, time: time)
             try prefetchData(raw: .wind_v_component_10m, time: time)
@@ -353,46 +472,62 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
             try prefetchData(raw: .temperature_2m, time: time)
             try prefetchData(raw: .wind_u_component_10m, time: time)
             try prefetchData(raw: .wind_v_component_10m, time: time)
-            try prefetchData(raw: .dewpoint_2m, time: time)
+            try prefetchData(raw: .dew_point_2m, time: time)
             try prefetchData(raw: .direct_radiation, time: time)
             try prefetchData(raw: .shortwave_radiation, time: time)
+        case .relative_humidity_2m:
+            fallthrough
         case .relativehumidity_2m:
             try prefetchData(raw: .temperature_2m, time: time)
-            try prefetchData(raw: .dewpoint_2m, time: time)
+            try prefetchData(raw: .dew_point_2m, time: time)
+        case .wind_direction_10m:
+            fallthrough
         case .winddirection_10m:
             try prefetchData(raw: .wind_u_component_10m, time: time)
             try prefetchData(raw: .wind_v_component_10m, time: time)
+        case .wind_speed_100m:
+            fallthrough
         case .windspeed_100m:
             try prefetchData(raw: .wind_u_component_100m, time: time)
             try prefetchData(raw: .wind_v_component_100m, time: time)
+        case .wind_direction_100m:
+            fallthrough
         case .winddirection_100m:
             try prefetchData(raw: .wind_u_component_100m, time: time)
             try prefetchData(raw: .wind_v_component_100m, time: time)
+        case .vapour_pressure_deficit:
+            fallthrough
         case .vapor_pressure_deficit:
             try prefetchData(raw: .temperature_2m, time: time)
-            try prefetchData(raw: .dewpoint_2m, time: time)
+            try prefetchData(raw: .dew_point_2m, time: time)
+        case .global_tilted_irradiance, .global_tilted_irradiance_instant:
+            fallthrough
         case .diffuse_radiation:
             try prefetchData(raw: .shortwave_radiation, time: time)
             try prefetchData(raw: .direct_radiation, time: time)
         case .et0_fao_evapotranspiration:
             try prefetchData(raw: .shortwave_radiation, time: time)
             try prefetchData(raw: .temperature_2m, time: time)
-            try prefetchData(raw: .dewpoint_2m, time: time)
+            try prefetchData(raw: .dew_point_2m, time: time)
             try prefetchData(raw: .wind_u_component_10m, time: time)
             try prefetchData(raw: .wind_v_component_10m, time: time)
         case .surface_pressure:
             try prefetchData(raw: .pressure_msl, time: time)
         case .snowfall:
             try prefetchData(raw: .snowfall_water_equivalent, time: time)
+        case .cloud_cover:
+            fallthrough
         case .cloudcover:
-            try prefetchData(raw: .cloudcover_low, time: time)
-            try prefetchData(raw: .cloudcover_mid, time: time)
-            try prefetchData(raw: .cloudcover_high, time: time)
+            try prefetchData(raw: .cloud_cover_low, time: time)
+            try prefetchData(raw: .cloud_cover_mid, time: time)
+            try prefetchData(raw: .cloud_cover_high, time: time)
         case .direct_normal_irradiance:
             try prefetchData(raw: .direct_radiation, time: time)
         case .rain:
             try prefetchData(raw: .precipitation, time: time)
             try prefetchData(raw: .snowfall_water_equivalent, time: time)
+        case .weather_code:
+            fallthrough
         case .weathercode:
             try prefetchData(derived: .cloudcover, time: time)
             try prefetchData(raw: .precipitation, time: time)
@@ -409,7 +544,7 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
             try prefetchData(raw: .temperature_2m, time: time)
         case .leaf_wetness_probability:
             try prefetchData(raw: .precipitation, time: time)
-            try prefetchData(raw: .dewpoint_2m, time: time)
+            try prefetchData(raw: .dew_point_2m, time: time)
             try prefetchData(raw: .temperature_2m, time: time)
         case .soil_moisture_index_0_to_7cm:
             try prefetchData(raw: .soil_moisture_0_to_7cm, time: time)
@@ -435,10 +570,25 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
             try prefetchData(raw: .direct_radiation, time: time)
         case .direct_normal_irradiance_instant:
             try prefetchData(raw: .direct_radiation, time: time)
+        case .wet_bulb_temperature_2m:
+            try prefetchData(raw: .dew_point_2m, time: time)
+            try prefetchData(raw: .temperature_2m, time: time)
+        case .cloudcover_low:
+            try prefetchData(raw: .cloud_cover_low, time: time)
+        case .cloudcover_mid:
+            try prefetchData(raw: .cloud_cover_mid, time: time)
+        case .cloudcover_high:
+            try prefetchData(raw: .cloud_cover_high, time: time)
+        case .windgusts_10m:
+            try prefetchData(raw: .wind_gusts_10m, time: time)
+        case .dewpoint_2m:
+            try prefetchData(raw: .dew_point_2m, time: time)
+        case .sunshine_duration:
+            try prefetchData(raw: .direct_radiation, time: time)
         }
     }
     
-    func get(variable: Era5HourlyVariable, time: TimerangeDt) throws -> DataAndUnit {
+    func get(variable: Era5HourlyVariable, time: TimerangeDtAndSettings) throws -> DataAndUnit {
         switch variable {
         case .raw(let variable):
             return try get(raw: variable, time: time)
@@ -447,76 +597,90 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
         }
     }
     
-    func get(derived: Era5VariableDerived, time: TimerangeDt) throws -> DataAndUnit {
+    func get(derived: Era5VariableDerived, time: TimerangeDtAndSettings) throws -> DataAndUnit {
         switch derived {
+        case .wind_speed_10m:
+            fallthrough
         case .windspeed_10m:
             let u = try get(raw: .wind_u_component_10m, time: time)
             let v = try get(raw: .wind_v_component_10m, time: time)
             let speed = zip(u.data,v.data).map(Meteorology.windspeed)
-            return DataAndUnit(speed, .ms)
+            return DataAndUnit(speed, .metrePerSecond)
         case .apparent_temperature:
             let windspeed = try get(derived: .windspeed_10m, time: time).data
             let temperature = try get(raw: .temperature_2m, time: time).data
             let relhum = try get(derived: .relativehumidity_2m, time: time).data
             let radiation = try get(raw: .shortwave_radiation, time: time).data
-            return DataAndUnit(Meteorology.apparentTemperature(temperature_2m: temperature, relativehumidity_2m: relhum, windspeed_10m: windspeed, shortware_radiation: radiation), .celsius)
+            return DataAndUnit(Meteorology.apparentTemperature(temperature_2m: temperature, relativehumidity_2m: relhum, windspeed_10m: windspeed, shortwave_radiation: radiation), .celsius)
+        case .relative_humidity_2m:
+            fallthrough
         case .relativehumidity_2m:
             let temperature = try get(raw: .temperature_2m, time: time).data
-            let dew = try get(raw: .dewpoint_2m, time: time).data
+            let dew = try get(raw: .dew_point_2m, time: time).data
             let relativeHumidity = zip(temperature, dew).map(Meteorology.relativeHumidity)
-            return DataAndUnit(relativeHumidity, .percent)
+            return DataAndUnit(relativeHumidity, .percentage)
+        case .wind_direction_10m:
+            fallthrough
         case .winddirection_10m:
             let u = try get(raw: .wind_u_component_10m, time: time).data
             let v = try get(raw: .wind_v_component_10m, time: time).data
             let direction = Meteorology.windirectionFast(u: u, v: v)
             return DataAndUnit(direction, .degreeDirection)
+        case .wind_speed_100m:
+            fallthrough
         case .windspeed_100m:
             let u = try get(raw: .wind_u_component_100m, time: time)
             let v = try get(raw: .wind_v_component_100m, time: time)
             let speed = zip(u.data,v.data).map(Meteorology.windspeed)
-            return DataAndUnit(speed, .ms)
+            return DataAndUnit(speed, .metrePerSecond)
+        case .wind_direction_100m:
+            fallthrough
         case .winddirection_100m:
             let u = try get(raw: .wind_u_component_100m, time: time).data
             let v = try get(raw: .wind_v_component_100m, time: time).data
             let direction = Meteorology.windirectionFast(u: u, v: v)
             return DataAndUnit(direction, .degreeDirection)
+        case .vapour_pressure_deficit:
+            fallthrough
         case .vapor_pressure_deficit:
             let temperature = try get(raw: .temperature_2m, time: time).data
-            let dewpoint = try get(raw: .dewpoint_2m, time: time).data
-            return DataAndUnit(zip(temperature,dewpoint).map(Meteorology.vaporPressureDeficit), .kiloPascal)
+            let dewpoint = try get(raw: .dew_point_2m, time: time).data
+            return DataAndUnit(zip(temperature,dewpoint).map(Meteorology.vaporPressureDeficit), .kilopascal)
         case .et0_fao_evapotranspiration:
-            let exrad = Zensun.extraTerrestrialRadiationBackwards(latitude: modelLat, longitude: modelLon, timerange: time)
+            let exrad = Zensun.extraTerrestrialRadiationBackwards(latitude: modelLat, longitude: modelLon, timerange: time.time)
             let swrad = try get(raw: .shortwave_radiation, time: time).data
             let temperature = try get(raw: .temperature_2m, time: time).data
             let windspeed = try get(derived: .windspeed_10m, time: time).data
-            let dewpoint = try get(raw: .dewpoint_2m, time: time).data
+            let dewpoint = try get(raw: .dew_point_2m, time: time).data
             
             let et0 = swrad.indices.map { i in
                 return Meteorology.et0Evapotranspiration(temperature2mCelsius: temperature[i], windspeed10mMeterPerSecond: windspeed[i], dewpointCelsius: dewpoint[i], shortwaveRadiationWatts: swrad[i], elevation: self.modelElevation.numeric, extraTerrestrialRadiation: exrad[i], dtSeconds: 3600)
             }
-            return DataAndUnit(et0, .millimeter)
+            return DataAndUnit(et0, .millimetre)
         case .diffuse_radiation:
             let swrad = try get(raw: .shortwave_radiation, time: time).data
             let direct = try get(raw: .direct_radiation, time: time).data
             let diff = zip(swrad,direct).map(-)
-            return DataAndUnit(diff, .wattPerSquareMeter)
+            return DataAndUnit(diff, .wattPerSquareMetre)
         case .surface_pressure:
             let temperature = try get(raw: .temperature_2m, time: time).data
             let pressure = try get(raw: .pressure_msl, time: time)
             return DataAndUnit(Meteorology.surfacePressure(temperature: temperature, pressure: pressure.data, elevation: targetElevation), pressure.unit)
+        case .cloud_cover:
+            fallthrough
         case .cloudcover:
-            let low = try get(raw: .cloudcover_low, time: time).data
-            let mid = try get(raw: .cloudcover_mid, time: time).data
-            let high = try get(raw: .cloudcover_high, time: time).data
-            return DataAndUnit(Meteorology.cloudCoverTotal(low: low, mid: mid, high: high), .percent)
+            let low = try get(raw: .cloud_cover_low, time: time).data
+            let mid = try get(raw: .cloud_cover_mid, time: time).data
+            let high = try get(raw: .cloud_cover_high, time: time).data
+            return DataAndUnit(Meteorology.cloudCoverTotal(low: low, mid: mid, high: high), .percentage)
         case .snowfall:
             let snowwater = try get(raw: .snowfall_water_equivalent, time: time).data
             let snowfall = snowwater.map { $0 * 0.7 }
-            return DataAndUnit(snowfall, .centimeter)
+            return DataAndUnit(snowfall, .centimetre)
         case .direct_normal_irradiance:
             let dhi = try get(raw: .direct_radiation, time: time).data
-            let dni = Zensun.calculateBackwardsDNI(directRadiation: dhi, latitude: modelLat, longitude: modelLon, timerange: time)
-            return DataAndUnit(dni, .wattPerSquareMeter)
+            let dni = Zensun.calculateBackwardsDNI(directRadiation: dhi, latitude: modelLat, longitude: modelLon, timerange: time.time)
+            return DataAndUnit(dni, .wattPerSquareMetre)
         case .rain:
             let snowwater = try get(raw: .snowfall_water_equivalent, time: time)
             let precip = try get(raw: .precipitation, time: time)
@@ -524,6 +688,8 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
                 return max($0.0-$0.1, 0)
             })
             return DataAndUnit(rain, precip.unit)
+        case .weather_code:
+            fallthrough
         case .weathercode:
             let cloudcover = try get(derived: .cloudcover, time: time).data
             let precipitation = try get(raw: .precipitation, time: time).data
@@ -538,7 +704,7 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
                 liftedIndex: nil,
                 visibilityMeters: nil,
                 categoricalFreezingRain: nil,
-                modelDtHours: time.dtSeconds / 3600), .wmoCode
+                modelDtSeconds: time.dtSeconds), .wmoCode
             )
         case .soil_moisture_0_to_100cm:
             let sm0_7 = try get(raw: .soil_moisture_0_to_7cm, time: time)
@@ -565,18 +731,18 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
             }), .gddCelsius)
         case .leaf_wetness_probability:
             let temperature = try get(raw: .temperature_2m, time: time).data
-            let dewpoint = try get(raw: .dewpoint_2m, time: time).data
+            let dewpoint = try get(raw: .dew_point_2m, time: time).data
             let precipitation = try get(raw: .precipitation, time: time).data
             return DataAndUnit(zip(zip(temperature, dewpoint), precipitation).map( {
                 let ((temperature, dewpoint), precipitation) = $0
                 return Meteorology.leafwetnessPorbability(temperature2mCelsius: temperature, dewpointCelsius: dewpoint, precipitation: precipitation)
-            }), .percent)
+            }), .percentage)
         case .soil_moisture_index_0_to_7cm:
             guard let soilType = try self.getStatic(type: .soilType) else {
                 throw ForecastapiError.generic(message: "Could not read ERA5 soil type")
             }
             guard let type = SoilTypeEra5(rawValue: Int(soilType)) else {
-                return DataAndUnit([Float](repeating: .nan, count: time.count), .fraction)
+                return DataAndUnit([Float](repeating: .nan, count: time.time.count), .fraction)
             }
             let soilMoisture = try get(raw: .soil_moisture_0_to_7cm, time: time)
             return DataAndUnit(type.calculateSoilMoistureIndex(soilMoisture.data), .fraction)
@@ -585,7 +751,7 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
                 throw ForecastapiError.generic(message: "Could not read ERA5 soil type")
             }
             guard let type = SoilTypeEra5(rawValue: Int(soilType)) else {
-                return DataAndUnit([Float](repeating: .nan, count: time.count), .fraction)
+                return DataAndUnit([Float](repeating: .nan, count: time.time.count), .fraction)
             }
             let soilMoisture = try get(raw: .soil_moisture_7_to_28cm, time: time)
             return DataAndUnit(type.calculateSoilMoistureIndex(soilMoisture.data), .fraction)
@@ -594,7 +760,7 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
                 throw ForecastapiError.generic(message: "Could not read ERA5 soil type")
             }
             guard let type = SoilTypeEra5(rawValue: Int(soilType)) else {
-                return DataAndUnit([Float](repeating: .nan, count: time.count), .fraction)
+                return DataAndUnit([Float](repeating: .nan, count: time.time.count), .fraction)
             }
             let soilMoisture = try get(raw: .soil_moisture_28_to_100cm, time: time)
             return DataAndUnit(type.calculateSoilMoistureIndex(soilMoisture.data), .fraction)
@@ -603,7 +769,7 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
                 throw ForecastapiError.generic(message: "Could not read ERA5 soil type")
             }
             guard let type = SoilTypeEra5(rawValue: Int(soilType)) else {
-                return DataAndUnit([Float](repeating: .nan, count: time.count), .fraction)
+                return DataAndUnit([Float](repeating: .nan, count: time.time.count), .fraction)
             }
             let soilMoisture = try get(raw: .soil_moisture_100_to_255cm, time: time)
             return DataAndUnit(type.calculateSoilMoistureIndex(soilMoisture.data), .fraction)
@@ -612,34 +778,65 @@ struct Era5Reader<Reader: GenericReaderProtocol>: GenericReaderDerivedSimple, Ge
                 throw ForecastapiError.generic(message: "Could not read ERA5 soil type")
             }
             guard let type = SoilTypeEra5(rawValue: Int(soilType)) else {
-                return DataAndUnit([Float](repeating: .nan, count: time.count), .fraction)
+                return DataAndUnit([Float](repeating: .nan, count: time.time.count), .fraction)
             }
             let soilMoisture = try get(derived: .soil_moisture_0_to_100cm, time: time)
             return DataAndUnit(type.calculateSoilMoistureIndex(soilMoisture.data), .fraction)
         case .is_day:
-            return DataAndUnit(Zensun.calculateIsDay(timeRange: time, lat: reader.modelLat, lon: reader.modelLon), .dimensionless_integer)
+            return DataAndUnit(Zensun.calculateIsDay(timeRange: time.time, lat: reader.modelLat, lon: reader.modelLon), .dimensionlessInteger)
         case .terrestrial_radiation:
-            let solar = Zensun.extraTerrestrialRadiationBackwards(latitude: reader.modelLat, longitude: reader.modelLon, timerange: time)
-            return DataAndUnit(solar, .wattPerSquareMeter)
+            let solar = Zensun.extraTerrestrialRadiationBackwards(latitude: reader.modelLat, longitude: reader.modelLon, timerange: time.time)
+            return DataAndUnit(solar, .wattPerSquareMetre)
         case .terrestrial_radiation_instant:
-            let solar = Zensun.extraTerrestrialRadiationInstant(latitude: reader.modelLat, longitude: reader.modelLon, timerange: time)
-            return DataAndUnit(solar, .wattPerSquareMeter)
+            let solar = Zensun.extraTerrestrialRadiationInstant(latitude: reader.modelLat, longitude: reader.modelLon, timerange: time.time)
+            return DataAndUnit(solar, .wattPerSquareMetre)
         case .shortwave_radiation_instant:
             let sw = try get(raw: .shortwave_radiation, time: time)
-            let factor = Zensun.backwardsAveragedToInstantFactor(time: time, latitude: reader.modelLat, longitude: reader.modelLon)
+            let factor = Zensun.backwardsAveragedToInstantFactor(time: time.time, latitude: reader.modelLat, longitude: reader.modelLon)
             return DataAndUnit(zip(sw.data, factor).map(*), sw.unit)
         case .direct_normal_irradiance_instant:
             let direct = try get(derived: .direct_radiation_instant, time: time)
-            let dni = Zensun.calculateInstantDNI(directRadiation: direct.data, latitude: reader.modelLat, longitude: reader.modelLon, timerange: time)
+            let dni = Zensun.calculateInstantDNI(directRadiation: direct.data, latitude: reader.modelLat, longitude: reader.modelLon, timerange: time.time)
             return DataAndUnit(dni, direct.unit)
         case .direct_radiation_instant:
             let direct = try get(raw: .direct_radiation, time: time)
-            let factor = Zensun.backwardsAveragedToInstantFactor(time: time, latitude: reader.modelLat, longitude: reader.modelLon)
+            let factor = Zensun.backwardsAveragedToInstantFactor(time: time.time, latitude: reader.modelLat, longitude: reader.modelLon)
             return DataAndUnit(zip(direct.data, factor).map(*), direct.unit)
         case .diffuse_radiation_instant:
             let diff = try get(derived: .diffuse_radiation, time: time)
-            let factor = Zensun.backwardsAveragedToInstantFactor(time: time, latitude: reader.modelLat, longitude: reader.modelLon)
+            let factor = Zensun.backwardsAveragedToInstantFactor(time: time.time, latitude: reader.modelLat, longitude: reader.modelLon)
             return DataAndUnit(zip(diff.data, factor).map(*), diff.unit)
+        case .wet_bulb_temperature_2m:
+            let temperature = try get(raw: .temperature_2m, time: time)
+            let dew = try get(raw: .dew_point_2m, time: time).data
+            let rh = zip(temperature.data, dew).map(Meteorology.relativeHumidity)
+            return DataAndUnit(zip(temperature.data, rh).map(Meteorology.wetBulbTemperature), temperature.unit)
+        case .cloudcover_low:
+            return try get(raw: .cloud_cover_low, time: time)
+        case .cloudcover_mid:
+            return try get(raw: .cloud_cover_mid, time: time)
+        case .cloudcover_high:
+            return try get(raw: .cloud_cover_high, time: time)
+        case .windgusts_10m:
+            return try get(raw: .wind_gusts_10m, time: time)
+        case .dewpoint_2m:
+            return try get(raw: .dew_point_2m, time: time)
+        case .sunshine_duration:
+            let directRadiation = try get(raw: .direct_radiation, time: time)
+            let duration = Zensun.calculateBackwardsSunshineDuration(directRadiation: directRadiation.data, latitude: reader.modelLat, longitude: reader.modelLon, timerange: time.time)
+            return DataAndUnit(duration, .seconds)
+        case .global_tilted_irradiance:
+            let directRadiation = try get(raw: .direct_radiation, time: time).data
+            let ghi = try get(raw: .shortwave_radiation, time: time).data
+            let diffuseRadiation = zip(ghi, directRadiation).map(-)
+            let gti = Zensun.calculateTiltedIrradiance(directRadiation: directRadiation, diffuseRadiation: diffuseRadiation, tilt: try options.getTilt(), azimuth: try options.getAzimuth(), latitude: reader.modelLat, longitude: reader.modelLon, timerange: time.time, convertBackwardsToInstant: false)
+            return DataAndUnit(gti, .wattPerSquareMetre)
+        case .global_tilted_irradiance_instant:
+            let directRadiation = try get(raw: .direct_radiation, time: time).data
+            let ghi = try get(raw: .shortwave_radiation, time: time).data
+            let diffuseRadiation = zip(ghi, directRadiation).map(-)
+            let gti = Zensun.calculateTiltedIrradiance(directRadiation: directRadiation, diffuseRadiation: diffuseRadiation, tilt: try options.getTilt(), azimuth: try options.getAzimuth(), latitude: reader.modelLat, longitude: reader.modelLon, timerange: time.time, convertBackwardsToInstant: true)
+            return DataAndUnit(gti, .wattPerSquareMetre)
         }
     }
 }

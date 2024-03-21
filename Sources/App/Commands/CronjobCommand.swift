@@ -42,6 +42,7 @@ struct CronjobCommand: Command {
         40 3,9,15,21 * * * /usr/local/bin/openmeteo-api download-gfs gfs025 > ~/log/gfs025.log 2>&1 || cat ~/log/gfs025.log
         40 3,9,15,21 * * * /usr/local/bin/openmeteo-api download-gfs gfs013 > ~/log/gfs013.log 2>&1 || cat ~/log/gfs013.log
         55 * * * * /usr/local/bin/openmeteo-api download-gfs hrrr_conus > ~/log/hrrr_conus.log 2>&1 || cat ~/log/hrrr_conus.log
+        55 * * * * /usr/local/bin/openmeteo-api download-gfs hrrr_conus_15min > ~/log/hrrr_conus_15min.log 2>&1 || cat ~/log/hrrr_conus_15min.log
         
         40 3,9,15,21 * * * /usr/local/bin/openmeteo-api download-gfs gfs025 --upper-level > ~/log/gfs025_upper-level.log 2>&1 || cat ~/log/gfs025_upper-level.log
         55 * * * * /usr/local/bin/openmeteo-api download-gfs hrrr_conus --upper-level > ~/log/hrrr_conus_upper-level.log 2>&1 || cat ~/log/hrrr_conus_upper-level.log
@@ -63,6 +64,10 @@ struct CronjobCommand: Command {
         47 2,8,14,20 * * * /usr/local/bin/openmeteo-api download-gem gem_regional > ~/log/gem_regional.log 2>&1 || cat ~/log/gem_regional.log
         39 3,15 * * * /usr/local/bin/openmeteo-api download-gem gem_global > ~/log/gem_global.log 2>&1 || cat ~/log/gem_global.log
         
+        
+        40 4,16 * * * /usr/local/bin/openmeteo-api download-arpae cosmo_2i --concurrent 4 > ~/log/cosmo_2i.log 2>&1 || cat ~/log/cosmo_2i.log
+        45 3,15 * * * /usr/local/bin/openmeteo-api download-arpae cosmo_5m --concurrent 4 > ~/log/cosmo_5m.log 2>&1 || cat ~/log/cosmo_5m.log
+        50 0,3,6,9,12,15,18,21 * * * /usr/local/bin/openmeteo-api download-arpae cosmo_2i_ruc --concurrent 4 > ~/log/cosmo_2i_ruc.log 2>&1 || cat ~/log/cosmo_2i_ruc.log
         
         
         # Ensemble models

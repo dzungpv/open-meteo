@@ -12,10 +12,23 @@ import Foundation
 extension Process {
     /// Set open files limit to 64k
     public static func setOpenFileLimitto64k() {
-        var filelimit = rlimit(rlim_cur: 65536, rlim_max: 65536)
-        if setrlimit(OS_RLIMIT, &filelimit) == -1 {
-            print("[WARNING] Could not set number of open file limit to 65536). \(String(cString: strerror(errno)))")
+        for limit in [1024*1024, 524288, 65536] {
+            var filelimit = rlimit(rlim_cur: rlim_t(limit), rlim_max: rlim_t(limit))
+            guard setrlimit(OS_RLIMIT, &filelimit) != -1 else {
+                print("[ WARNING ] Could not set number of open file limit to \(limit). \(String(cString: strerror(errno)))")
+                continue
+            }
+            return
         }
+    }
+    
+    /// Set alarm to terminate the process in case it gets stuck
+    public static func alarm(seconds: Int) {
+        #if os(Linux)
+        Glibc.alarm(UInt32(seconds))
+        #else
+        Darwin.alarm(UInt32(seconds))
+        #endif
     }
 }
 

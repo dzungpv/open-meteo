@@ -6,6 +6,7 @@ struct DemController {
     struct Query: Content {
         let latitude: [Float]
         let longitude: [Float]
+        let apikey: String?
         
         func validate() throws {
             guard latitude.count == longitude.count else {
@@ -28,14 +29,15 @@ struct DemController {
         }
     }
 
-    func query(_ req: Request) throws -> EventLoopFuture<Response> {
-        if req.headers[.host].contains(where: { $0 == "open-meteo.com"}) {
-            throw Abort.init(.notFound)
-        }
-        let params = try req.query.decode(Query.self)
+    func query(_ req: Request) async throws -> Response {
+        try await req.ensureSubdomain("api")
+        let params = req.method == .POST ? try req.content.decode(Query.self) : try req.query.decode(Query.self)
+        try req.ensureApiKey("api", apikey: params.apikey)
+        
         try params.validate()
+        await req.incrementRateLimiter(weight: 1)
         // Run query on separat thread pool to not block the main pool
-        return ForecastapiController.runLoop.next().submit({
+        return try await ForecastapiController.runLoop.next().submit({
             let elevation = try zip(params.latitude, params.longitude).map { (latitude, longitude) in
                 try Dem90.read(lat: latitude, lon: longitude)
             }
@@ -44,7 +46,7 @@ struct DemController {
             return Response(status: .ok, headers: headers, body: .init(string: """
                {"elevation":\(elevation)}
                """))
-        })
+        }).get()
     }
 }
 

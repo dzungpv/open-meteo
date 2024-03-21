@@ -4,7 +4,7 @@ import Foundation
 protocol MultiDomainMixerDomain: RawRepresentableString {
     var countEnsembleMember: Int { get }
     
-    func getReader(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws -> [any GenericReaderProtocol]
+    func getReader(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> [any GenericReaderProtocol]
 }
 
 /// Combine multiple independent weather models, that may not have given forecast variable
@@ -34,8 +34,8 @@ struct GenericReaderMulti<Variable: GenericVariableMixable> {
         self.domain = domain
     }
     
-    public init?(domain: MultiDomainMixerDomain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws {
-        let reader = try domain.getReader(lat: lat, lon: lon, elevation: elevation, mode: mode)
+    public init?(domain: MultiDomainMixerDomain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws {
+        let reader = try domain.getReader(lat: lat, lon: lon, elevation: elevation, mode: mode, options: options)
         guard !reader.isEmpty else {
             return nil
         }
@@ -43,27 +43,35 @@ struct GenericReaderMulti<Variable: GenericVariableMixable> {
         self.reader = reader
     }
     
-    func prefetchData(variable: Variable, time: TimerangeDt) throws {
+    func prefetchData(variable: Variable, time: TimerangeDtAndSettings) throws {
         for reader in reader {
+            if time.dtSeconds > reader.modelDtSeconds {
+                /// 15 minutely domain while reading hourly data
+                continue
+            }
             if try reader.prefetchData(mixed: variable.rawValue, time: time) {
                 break
             }
         }
     }
     
-    func prefetchData(variables: [Variable], time: TimerangeDt) throws {
+    func prefetchData(variables: [Variable], time: TimerangeDtAndSettings) throws {
         try variables.forEach { variable in
             try prefetchData(variable: variable, time: time)
         }
     }
     
-    func get(variable: Variable, time: TimerangeDt) throws -> DataAndUnit? {
+    func get(variable: Variable, time: TimerangeDtAndSettings) throws -> DataAndUnit? {
         // Last reader return highest resolution data. therefore reverse iteration
         // Integrate now lower resolution models
         var data: [Float]? = nil
         var unit: SiUnit? = nil
         if variable.requiresOffsetCorrectionForMixing {
             for r in reader.reversed() {
+                if time.dtSeconds > r.modelDtSeconds {
+                    /// 15 minutely domain while reading hourly data
+                    continue
+                }
                 guard let d = try r.get(mixed: variable.rawValue, time: time) else {
                     continue
                 }
@@ -81,10 +89,14 @@ struct GenericReaderMulti<Variable: GenericVariableMixable> {
             }
             // undo delta operation
             data?.deltaDecode()
-
+            data?.greater(than: 0)
         } else {
             // default case, just place new data in 1:1
             for r in reader.reversed() {
+                if time.dtSeconds > r.modelDtSeconds {
+                    /// 15 minutely domain while reading hourly data
+                    continue
+                }
                 guard let d = try r.get(mixed: variable.rawValue, time: time) else {
                     continue
                 }
@@ -109,14 +121,14 @@ struct GenericReaderMulti<Variable: GenericVariableMixable> {
 
 /// Conditional conformace just use RawValue (String) to resolve `ForecastVariable` to a specific type
 extension GenericReaderProtocol {
-    func get(mixed: String, time: TimerangeDt) throws -> DataAndUnit? {
+    func get(mixed: String, time: TimerangeDtAndSettings) throws -> DataAndUnit? {
         guard let v = MixingVar(rawValue: mixed) else {
             return nil
         }
         return try self.get(variable: v, time: time)
     }
     
-    func prefetchData(mixed: String, time: TimerangeDt) throws -> Bool {
+    func prefetchData(mixed: String, time: TimerangeDtAndSettings) throws -> Bool {
         guard let v = MixingVar(rawValue: mixed) else {
             return false
         }

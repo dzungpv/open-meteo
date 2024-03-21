@@ -35,18 +35,16 @@ extension Curl {
     }
     
     /// Download a ECMWF grib file from the opendata server, but selectively get messages and download only partial file
-    func downloadEcmwfIndexed(url: String, isIncluded: (EcmwfIndexEntry) -> Bool) async throws -> [GribMessage] {
+    func downloadEcmwfIndexed(url: String, concurrent: Int, isIncluded: (EcmwfIndexEntry) -> Bool) async throws -> AnyAsyncSequence<GribMessage> {
         let urlIndex = url.replacingOccurrences(of: ".grib2", with: ".index")
         let index = try await downloadInMemoryAsync(url: urlIndex, minSize: nil).readEcmwfIndexEntries().filter(isIncluded)
         guard !index.isEmpty else {
             fatalError("Empty grib selection")
         }
         let ranges = index.indexToRange()
-        var results = [GribMessage]()
-        for range in ranges {
-            results.append(contentsOf: try await downloadGrib(url: url, bzip2Decode: false, range: range.range, minSize: range.minSize))
-        }
-        return results
+        return ranges.mapStream(nConcurrent: 1, body: {
+            range in try await self.downloadGrib(url: url, bzip2Decode: false, range: range.range, minSize: range.minSize, nConcurrent: concurrent)
+        }).flatMap({$0.mapStream(nConcurrent: 1, body: {$0})}).eraseToAnyAsyncSequence()
     }
     
     /// Download index file and match against curl variable
@@ -150,28 +148,6 @@ extension Curl {
                 try await Task.sleep(nanoseconds: UInt64(5 * 1_000_000_000 * min(10, retries)))
             }
         }
-    }
-    
-    /// download using index ranges, BUT only single ranges and not multiple ranges.... AWS S3 does not support multi ranges
-    func downloadIndexedGribSequential<Variable: CurlIndexedVariable>(url: String, variables: [Variable], extension: String = ".idx") async throws -> [(variable: Variable, message: GribMessage)] {
-        
-        guard let inventory = try await downloadIndexAndDecode(url: ["\(url)\(`extension`)"], variables: variables).first else {
-            return []
-        }
-        
-        let ranges = inventory.range.split(separator: ",")
-        var messages = [GribMessage]()
-        messages.reserveCapacity(inventory.matches.count)
-        for range in ranges {
-            let m = try await downloadGrib(url: url, bzip2Decode: false, range: String(range))
-            m.forEach({messages.append($0)})
-        }
-        if messages.count != inventory.matches.count {
-            logger.error("Grib reader did not get all matched variables. Matches count \(inventory.matches.count). Grib count \(messages.count)")
-            throw CurlError.didNotGetAllGribMessages(got: messages.count, expected: inventory.matches.count)
-        }
-        
-        return zip(inventory.matches, messages).map({($0,$1)})
     }
 }
 

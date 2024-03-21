@@ -42,10 +42,27 @@ struct GribAsyncStreamHelper {
             let length: UInt64
         }
         
-        let header = base.advanced(by: offset).assumingMemoryBound(to: GribHeader.self)
-        let length = header.pointee.length.bigEndian
+        let header = base.advanced(by: offset).assumingMemoryBound(to: GribHeader.self).pointee
         
-        guard (1...2).contains(header.pointee.version), length <= (1 << 40) else {
+        // GRIB1 detection
+        if header.version == 1 {
+            // 1-4 identifier = GRIB
+            // 5-7 totalLength = 4284072
+            // 8 editionNumber = 1
+            // Read 24 bytes as bigEndian and turn into UInt32
+            let base = base.advanced(by: offset + 4).assumingMemoryBound(to: UInt32.self).pointee
+            let masked = (base & 0x00ffffff)
+            let shifted = (masked << 8)
+            let length = shifted.bigEndian
+            guard length <= (1 << 24) else {
+                return nil
+            }
+            return (offset, Int(length))
+        }
+        
+        let length = header.length.bigEndian
+        
+        guard (1...2).contains(header.version), length <= (1 << 40) else {
             return nil
         }
         return (offset, Int(length))
@@ -66,6 +83,9 @@ struct GribAsyncStream<T: AsyncSequence>: AsyncSequence where T.Element == ByteB
         
         /// Collect enough bytes to decompress a single message
         private var buffer: ByteBuffer
+        
+        /// Buffer mutliple messages to only return one at a time
+        private var messages: [GribMessage]? = nil
 
         fileprivate init(iterator: T.AsyncIterator) {
             self.iterator = iterator
@@ -73,7 +93,11 @@ struct GribAsyncStream<T: AsyncSequence>: AsyncSequence where T.Element == ByteB
             buffer.reserveCapacity(minimumWritableBytes: 4096)
         }
 
-        public func next() async throws -> [GribMessage]? {
+        public func next() async throws -> GribMessage? {
+            if let next = messages?.popLast() {
+                return next
+            }
+            
             while true {
                 // repeat until GRIB header is found
                 guard let seek = buffer.withUnsafeReadableBytes(GribAsyncStreamHelper.seekGrib) else {
@@ -95,13 +119,15 @@ struct GribAsyncStream<T: AsyncSequence>: AsyncSequence where T.Element == ByteB
                     buffer.writeImmutableBuffer(input)
                 }
                 
-                let messages = try buffer.readWithUnsafeReadableBytes({
+                messages = try buffer.readWithUnsafeReadableBytes({
                     let memory = UnsafeRawBufferPointer(rebasing: $0[seek.offset ..< seek.offset+seek.length])
                     let messages = try SwiftEccodes.getMessages(memory: memory, multiSupport: true)
                     return (seek.offset+seek.length, messages)
                 })
                 buffer.discardReadBytes()
-                return messages
+                if let next = messages?.popLast() {
+                    return next
+                }
             }
         }
     }

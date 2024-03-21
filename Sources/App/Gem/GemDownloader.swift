@@ -12,19 +12,13 @@ Gem regional and global Downloader
  - Global https://hpfx.collab.science.gc.ca/20221121/WXO-DD/model_gem_global/15km/grib2/lat_lon/00/
  - Regional https://hpfx.collab.science.gc.ca/20221121/WXO-DD/model_gem_regional/10km/grib2/00/
  */
-struct GemDownload: AsyncCommandFix {
+struct GemDownload: AsyncCommand {
     struct Signature: CommandSignature {
         @Argument(name: "domain")
         var domain: String
         
         @Option(name: "run")
         var run: String?
-        
-        @Option(name: "past-days")
-        var pastDays: Int?
-        
-        @Flag(name: "skip-existing", help: "ONLY FOR TESTING! Do not use in production. May update the database with stale data")
-        var skipExisting: Bool
         
         @Flag(name: "create-netcdf")
         var createNetcdf: Bool
@@ -37,6 +31,12 @@ struct GemDownload: AsyncCommandFix {
         
         @Option(name: "server", help: "Server base URL. Default 'https://hpfx.collab.science.gc.ca/YYYYMMDD/WXO-DD/'. Alternative 'https://dd.weather.gc.ca/'")
         var server: String?
+        
+        @Option(name: "concurrent", short: "c", help: "Numer of concurrent download/conversion jobs")
+        var concurrent: Int?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
     
     var help: String {
@@ -47,6 +47,7 @@ struct GemDownload: AsyncCommandFix {
         let start = DispatchTime.now()
         let logger = context.application.logger
         let domain = try GemDomain.load(rawValue: signature.domain)
+        let nConcurrent = signature.concurrent ?? 1
         
         let run = try signature.run.flatMap(Timestamp.fromRunHourOrYYYYMMDD) ?? domain.lastRun
         
@@ -85,15 +86,19 @@ struct GemDownload: AsyncCommandFix {
         try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
         
         try await downloadElevation(application: context.application, domain: domain, run: run, server: signature.server)
-        try await download(application: context.application, domain: domain, variables: variables, run: run, skipFilesIfExisting: signature.skipExisting, server: signature.server)
-        try convert(logger: logger, domain: domain, variables: variables, run: run, createNetcdf: signature.createNetcdf)
+        let handles = try await download(application: context.application, domain: domain, variables: variables, run: run, server: signature.server)
+        try await GenericVariableHandle.convert(logger: logger, domain: domain, createNetcdf: signature.createNetcdf, run: run, nMembers: domain.ensembleMembers, handles: handles, concurrent: nConcurrent)
         logger.info("Finished in \(start.timeElapsedPretty())")
+        
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: variables)
+        }
     }
     
     // download seamask and height
     func downloadElevation(application: Application, domain: GemDomain, run: Timestamp, server: String?) async throws {
         let logger = application.logger
-        let surfaceElevationFileOm = domain.surfaceElevationFileOm
+        let surfaceElevationFileOm = domain.surfaceElevationFileOm.getFilePath()
         if FileManager.default.fileExists(atPath: surfaceElevationFileOm) {
             return
         }
@@ -102,7 +107,6 @@ struct GemDownload: AsyncCommandFix {
         logger.info("Downloading height and elevation data")
         
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient, deadLineHours: 4)
-        
         var grib2d = GribArray2D(nx: domain.grid.nx, ny: domain.grid.ny)
         
         var height: [Float]
@@ -152,32 +156,41 @@ struct GemDownload: AsyncCommandFix {
         }
         
         //try Array2D(data: height, nx: domain.grid.nx, ny: domain.grid.ny).writeNetcdf(filename: "\(domain.downloadDirectory)terrain.nc")
-        
         try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 20, chunk1: 20).write(file: surfaceElevationFileOm, compressionType: .p4nzdec256, scalefactor: 1, all: height)
     }
     
     /// Download data and store as compressed files for each timestep
-    func download(application: Application, domain: GemDomain, variables: [GemVariableDownloadable], run: Timestamp, skipFilesIfExisting: Bool, server: String?) async throws {
+    func download(application: Application, domain: GemDomain, variables: [GemVariableDownloadable], run: Timestamp, server: String?) async throws -> [GenericVariableHandle] {
         let logger = application.logger
-        let curl = Curl(logger: logger, client: application.dedicatedHttpClient, deadLineHours: domain == .gem_global_ensemble ? 10 : 5)
+        let deadLineHours = (domain == .gem_global_ensemble || domain == .gem_global) ? 11 : 5.0
+        let curl = Curl(logger: logger, client: application.dedicatedHttpClient, deadLineHours: deadLineHours) // 12 hours and 6 hours interval so we let 1 hour for data conversion
         let downloadDirectory = domain.downloadDirectory
         let nMembers = domain.ensembleMembers
         
-        let nLocationsPerChunk = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil, chunknLocations: nMembers > 1 ? nMembers : nil).nLocationsPerChunk
+        let nLocationsPerChunk = OmFileSplitter(domain, nMembers: nMembers, chunknLocations: nMembers > 1 ? nMembers : nil).nLocationsPerChunk
         let writer = OmFileWriter(dim0: 1, dim1: domain.grid.count, chunk0: 1, chunk1: nLocationsPerChunk)
         
         var grib2d = GribArray2D(nx: domain.grid.nx, ny: domain.grid.ny)
+        var handles = [GenericVariableHandle]()
         
-        /// Keep data from previous timestep in memory to deaccumulate the next timestep
-        var previousData = [String: (step: Int, data: [Float])]()
+        /// Keep values from previous timestep. Actori isolated, because of concurrent data conversion
+        let deaverager = GribDeaverager()
                 
         let forecastHours = domain.getForecastHours(run: run)
         for hour in forecastHours {
             logger.info("Downloading hour \(hour)")
             let h3 = hour.zeroPadded(len: 3)
-            
+            struct GemSurfaceVariableMember: Hashable {
+                let variable: GemSurfaceVariable
+                let member: Int
+                
+                init(_ variable: GemSurfaceVariable, _ member: Int) {
+                    self.variable = variable
+                    self.member = member
+                }
+            }
             /// Keep wind vectors in memory to calculate wind speed / direction for ensemble
-            var inMemory = [VariableAndMemberAndControl<GemSurfaceVariable>: [Float]]()
+            var inMemory = [GemSurfaceVariableMember: [Float]]()
             
             for variable in variables {
                 guard let gribName = variable.gribName(domain: domain) else {
@@ -189,141 +202,79 @@ struct GemDownload: AsyncCommandFix {
                 if !variable.includedFor(hour: hour, domain: domain) {
                     continue
                 }
-                let filenameDest = "\(downloadDirectory)\(variable.omFileName.file)_\(h3).om"
-                if skipFilesIfExisting && FileManager.default.fileExists(atPath: filenameDest) {
-                    continue
-                }
-                
                 let url = domain.getUrl(run: run, hour: hour, gribName: gribName, server: server)
+                // snowfall file might be missing. Ignore any issues here
+                let isSnowfallWaterEq = domain == .gem_hrdps_continental && (gribName == "WEASN_Sfc" || gribName == "APCP_Sfc")
+                let deadLineHours = isSnowfallWaterEq ? 0.01 : nil
                 
-                for message in try await curl.downloadGrib(url: url, bzip2Decode: false) {
-                    let member = message.get(attribute: "perturbationNumber").flatMap(Int.init) ?? 0
-                    let memberStr = member > 0 ? "_\(member)" : ""
-                    let filenameDest = "\(downloadDirectory)\(variable.omFileName.file)_\(h3)\(memberStr).om"
-                    //try message.debugGrid(grid: domain.grid, flipLatidude: false, shift180Longitude: true)
-                    //fatalError()
-                    try grib2d.load(message: message)
-                    if domain == .gem_global_ensemble {
-                        // Only ensemble model is shifted by 180°
-                        grib2d.array.shift180Longitudee()
-                    }
-                    
-                    // Scaling before compression with scalefactor
-                    if let fma = variable.multiplyAdd(dtSeconds: domain.dtSeconds) {
-                        grib2d.array.data.multiplyAdd(multiply: fma.multiply, add: fma.add)
-                    }
-                    
-                    guard let stepRange = message.get(attribute: "stepRange") else {
-                        fatalError("could not get step range")
-                    }
-                    if stepRange.contains("-") {
-                        // data is accumulated since model start
-                        let startStep = Int(stepRange.split(separator: "-")[0])!
-                        let currentStep = Int(stepRange.split(separator: "-")[1])!
-                        let previous = previousData["\(variable.rawValue)\(memberStr)"]
-                        // Store data for the next run
-                        previousData["\(variable.rawValue)\(memberStr)"] = (currentStep, grib2d.array.data)
-                        if let previous, previous.step != startStep {
-                            /// For 6 hourly, divide it by 2, so interpolation does not need to care about precip sums
-                            let deltaHours = Float((currentStep - previous.step) / domain.dtHours)
-                            for l in previous.data.indices {
-                                grib2d.array.data[l] = (grib2d.array.data[l] - previous.data[l]) / deltaHours
-                            }
+                do {
+                    for message in try await curl.downloadGrib(url: url, bzip2Decode: false, deadLineHours: deadLineHours) {
+                        let member = message.get(attribute: "perturbationNumber").flatMap(Int.init) ?? 0
+                        let memberStr = member > 0 ? "_\(member)" : ""
+                        //try message.debugGrid(grid: domain.grid, flipLatidude: false, shift180Longitude: true)
+                        //fatalError()
+                        try grib2d.load(message: message)
+                        if domain == .gem_global_ensemble {
+                            // Only ensemble model is shifted by 180°
+                            grib2d.array.shift180Longitudee()
                         }
-                    }
-                    // GEM ensemble does not have wind speed and direction directly, calculate from u/v components
-                    if domain == .gem_global_ensemble, let variable = variable as? GemSurfaceVariable {
-                        // keep wind speed in memory, which actually contains wind U-component
-                        if [.windspeed_10m, .windspeed_40m, .windspeed_80m, .windspeed_120m].contains(variable) {
-                            inMemory[.init(variable, member)] = grib2d.array.data
+                        
+                        // Scaling before compression with scalefactor
+                        if let fma = variable.multiplyAdd(dtSeconds: domain.dtSeconds) {
+                            grib2d.array.data.multiplyAdd(multiply: fma.multiply, add: fma.add)
+                        }
+                        
+                        guard let stepRange = message.get(attribute: "stepRange"),
+                              let stepType = message.get(attribute: "stepType") else {
+                            fatalError("could not get step range")
+                        }
+                        // Deaccumulate precipitation
+                        guard await deaverager.deaccumulateIfRequired(variable: variable, member: member, stepType: stepType, stepRange: stepRange, grib2d: &grib2d) else {
                             continue
                         }
-                        if let windspeedVariable = variable.winddirectionCounterPartVariable {
-                            guard let u = inMemory[.init(windspeedVariable, member)] else {
-                                fatalError("Wind speed calculation requires \(windspeedVariable) to download")
+                        
+                        // GEM ensemble does not have wind speed and direction directly, calculate from u/v components
+                        if domain == .gem_global_ensemble, let variable = variable as? GemSurfaceVariable {
+                            // keep wind speed in memory, which actually contains wind U-component
+                            if [.wind_speed_10m, .wind_speed_40m, .wind_speed_80m, .wind_speed_120m].contains(variable) {
+                                inMemory[.init(variable, member)] = grib2d.array.data
+                                continue
                             }
-                            let windspeed = zip(u, grib2d.array.data).map(Meteorology.windspeed)
-                            try writer.write(file: "\(downloadDirectory)\(windspeedVariable.omFileName.file)_\(h3)\(memberStr).om", compressionType: .p4nzdec256, scalefactor: windspeedVariable.scalefactor, all: windspeed, overwrite: true)
-                            grib2d.array.data = Meteorology.windirectionFast(u: u, v: grib2d.array.data)
+                            if let windspeedVariable = variable.winddirectionCounterPartVariable {
+                                guard let u = inMemory[.init(windspeedVariable, member)] else {
+                                    fatalError("Wind speed calculation requires \(windspeedVariable) to download")
+                                }
+                                let windspeed = zip(u, grib2d.array.data).map(Meteorology.windspeed)
+                                let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: windspeedVariable.scalefactor, all: windspeed)
+                                handles.append(GenericVariableHandle(
+                                    variable: windspeedVariable,
+                                    time: run.add(hours: hour),
+                                    member: member,
+                                    fn: fn,
+                                    skipHour0: variable.skipHour0
+                                ))
+                                grib2d.array.data = Meteorology.windirectionFast(u: u, v: grib2d.array.data)
+                            }
                         }
+                        
+                        let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data)
+                        handles.append(GenericVariableHandle(
+                            variable: variable,
+                            time: run.add(hours: hour),
+                            member: member,
+                            fn: fn,
+                            skipHour0: variable.skipHour0
+                        ))
                     }
-                    
-                    //try grib2d.array.writeNetcdf(filename: "\(domain.downloadDirectory)\(variable.omFileName.file)_\(h3)\(memberStr).nc")
-                    try writer.write(file: filenameDest, compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data, overwrite: true)
+                } catch {
+                    if !isSnowfallWaterEq {
+                        throw error
+                    }
                 }
             }
         }
-        curl.printStatistics()
-    }
-    
-    /// Process each variable and update time-series optimised files
-    func convert(logger: Logger, domain: GemDomain, variables: [GemVariableDownloadable], run: Timestamp, createNetcdf: Bool) throws {
-        let downloadDirectory = domain.downloadDirectory
-        let grid = domain.grid
-        let nMembers = domain.ensembleMembers
-        
-        let forecastHours = domain.getForecastHours(run: run)
-        let nTime = forecastHours.max()! / domain.dtHours + 1
-        let time = TimerangeDt(start: run, nTime: nTime, dtSeconds: domain.dtSeconds)
-        let nLocations = grid.nx * grid.ny
-        
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: nLocations * nMembers, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil, chunknLocations: nMembers > 1 ? nMembers : nil)
-        let nLocationsPerChunk = om.nLocationsPerChunk
-        
-        var data3d = Array3DFastTime(nLocations: nLocationsPerChunk, nLevel: nMembers, nTime: nTime)
-        var readTemp = [Float](repeating: .nan, count: nLocationsPerChunk)
-
-        for variable in variables {
-            guard variable.gribName(domain: domain) != nil else {
-                continue
-            }
-            let skip = variable.skipHour0 ? 1 : 0
-
-            let progress = ProgressTracker(logger: logger, total: nLocations * nMembers, label: "Convert \(variable.rawValue)")
-            let readers: [(hour: Int, reader: [OmFileReader<MmapFile>])] = try forecastHours.compactMap({ hour in
-                if hour == 0 && variable.skipHour0 {
-                    return nil
-                }
-                if !variable.includedFor(hour: hour, domain: domain) {
-                    return nil
-                }
-                let h3 = hour.zeroPadded(len: 3)
-                let readers = try (0..<nMembers).map { member in
-                    let memberStr = member > 0 ? "_\(member)" : ""
-                    return try OmFileReader(file: "\(downloadDirectory)\(variable.omFileName.file)_\(h3)\(memberStr).om")
-                }
-                return (hour, readers)
-            })
-            
-            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, indexTime: time.toIndexTime(), skipFirst: skip, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor) { offset in
-                let d0offset = offset / nMembers
-                
-                let locationRange = d0offset ..< min(d0offset+nLocationsPerChunk, nLocations)
-                data3d.data.fillWithNaNs()
-                for reader in readers {
-                    for (i, memberReader) in reader.reader.enumerated() {
-                        try memberReader.read(into: &readTemp, arrayDim1Range: 0..<locationRange.count, arrayDim1Length: locationRange.count, dim0Slow: 0..<1, dim1: locationRange)
-                        data3d[0..<locationRange.count, i, reader.hour / domain.dtHours] = readTemp
-                    }
-                }
-                
-                if domain.dtHours == 3 {
-                    /// interpolate 6 to 3 hours for ensemble 0.5°
-                    data3d.interpolateInplace(
-                        type: variable.interpolation,
-                        skipFirst: skip,
-                        time: time,
-                        grid: domain.grid,
-                        locationRange: locationRange
-                    )
-                }
-                
-                progress.add(locationRange.count * nMembers)
-                return data3d.data[0..<locationRange.count * nMembers * nTime]
-            }
-            progress.finish()
-        }
+        await curl.printStatistics()
+        return handles
     }
 }
 

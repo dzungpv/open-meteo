@@ -3,114 +3,13 @@ import Foundation
 
 /// Solar position calculations based on zensun
 /// See https://gist.github.com/sangholee1990/eb3d997a9b28ace2dbcab6a45fd7c178#file-visualization_using_sun_position-pro-L306
+/// Revised using NREL Solar Posiition Altorithm SPA
 public struct Zensun {
     /// Watt per square meter
     static public let solarConstant = Float(1367.7)
     
     /// Lookup table for sun declination and equation of time
     public static let sunPosition = SolarPositonFastLookup()
-    
-    /// Calculate sun rise and set times
-    /// It is assumed the UTC offset has been applied already to `timeRange`. It will be removed in the next step
-    public static func calculateSunRiseSet(timeRange: Range<Timestamp>, lat: Float, lon: Float, utcOffsetSeconds: Int) -> (rise: [Timestamp], set: [Timestamp]) {
-        var rises = [Timestamp]()
-        var sets = [Timestamp]()
-        let nDays = (timeRange.upperBound.timeIntervalSince1970 - timeRange.lowerBound.timeIntervalSince1970) / 86400
-        rises.reserveCapacity(nDays)
-        sets.reserveCapacity(nDays)
-        for time in timeRange.stride(dtSeconds: 86400) {
-            let utc = time.add(utcOffsetSeconds)
-            switch calculateSunTransit(utcMidnight: utc, lat: lat, lon: lon) {
-            case .polarNight:
-                rises.append(Timestamp(0))
-                sets.append(Timestamp(0))
-            case .polarDay:
-                rises.append(Timestamp(0))
-                sets.append(Timestamp(0))
-            case .transit(rise: let rise, set: let set):
-                rises.append(utc.add(rise))
-                sets.append(utc.add(set))
-            }
-        }
-        assert(rises.count == nDays)
-        assert(sets.count == nDays)
-        return (rises, sets)
-    }
-    
-    /// Calculate daylight duration in seconds
-    /// Time MUST be 0 UTC, it will add the time to match the noon time based on longitude
-    /// The correct time is important to get the correct sun declination at local noon
-    public static func calculateDaylightDuration(utcMidnight: Range<Timestamp>, lat: Float, lon: Float) -> [Float] {
-        let noonTimeOffsetSeconds = Int((12-lon/15)*3600)
-        return utcMidnight.stride(dtSeconds: 86400).map { date in
-            let t1 = date.add(noonTimeOffsetSeconds).getSunDeclination().degreesToRadians
-            let alpha = Float(0.83333).degreesToRadians
-            let t0 = lat.degreesToRadians
-            let arg = -(sin(alpha)+sin(t0)*sin(t1))/(cos(t0)*cos(t1))
-            guard arg <= 1 && arg >= -1 else {
-                // polar night or day
-                return arg > 1 ? 0 : 24*3600
-            }
-            let dtime = acos(arg)/(Float(15).degreesToRadians)
-            return dtime * 2 * 3600
-        }
-    }
-    
-    public enum SunTransit {
-        case polarNight
-        case polarDay
-        /// Seconds after midnight in local time!
-        case transit(rise: Int, set: Int)
-    }
-    
-    /// Time MUST be 0 UTC, it will add the time to match the noon time based on longitude
-    /// The correct time is important to get the correct sun declination at local noon
-    @inlinable static func calculateSunTransit(utcMidnight: Timestamp, lat: Float, lon: Float) -> SunTransit {
-        let localMidday = utcMidnight.add(Int((12-lon/15)*3600))
-        let eqtime = localMidday.getSunEquationOfTime()
-        let t1 = localMidday.getSunDeclination().degreesToRadians
-        let alpha = Float(0.83333).degreesToRadians
-        let noon = 12-lon/15
-        let t0 = lat.degreesToRadians
-        let arg = -(sin(alpha)+sin(t0)*sin(t1))/(cos(t0)*cos(t1))
-        
-        guard arg <= 1 && arg >= -1 else {
-            return arg > 1 ? .polarNight : .polarDay
-        }
-        
-        let dtime = acos(arg)/(Float(15).degreesToRadians)
-        let sunrise = noon-dtime-eqtime
-        let sunset = noon+dtime-eqtime
-        return .transit(rise: Int(sunrise*3600), set: Int(sunset*3600))
-    }
-    
-    /// Calculate if a given timestep has daylight (`1`) or not (`0`) using sun transit calculation
-    public static func calculateIsDay(timeRange: TimerangeDt, lat: Float, lon: Float) -> [Float] {
-        let universalUtcOffsetSeconds = Int(lon/15 * 3600)
-        var lastCalculatedTransit: (date: Timestamp, transit: SunTransit)? = nil
-        return timeRange.map({ time -> Float in
-            // As we iteratate over an hourly range, caculate local-time midnight night for the given timestamp
-            let localMidnight = time.add(universalUtcOffsetSeconds).floor(toNearest: 24*3600).add(-1 * universalUtcOffsetSeconds)
-            
-            // calculate new transit if required
-            if lastCalculatedTransit?.date != localMidnight {
-                lastCalculatedTransit = (localMidnight, calculateSunTransit(utcMidnight: localMidnight, lat: lat, lon: lon))
-            }
-            guard let lastCalculatedTransit else {
-                fatalError("Not possible")
-            }
-            switch lastCalculatedTransit.transit {
-            case .polarNight:
-                return 0
-            case .polarDay:
-                return 1
-            case .transit(rise: let rise, set: let set):
-                // Compare in local time
-                let secondsSinceMidnight = time.add(universalUtcOffsetSeconds).secondsSinceMidnight
-                return secondsSinceMidnight > (rise+universalUtcOffsetSeconds) && secondsSinceMidnight < (set+universalUtcOffsetSeconds) ? 1 : 0
-            }
-        })
-    }
     
     /// Calculate a 2d (space and time) solar factor field for interpolation to hourly data. Data is time oriented!
     /// This function is performance critical for updates. This explains redundant code.
@@ -296,140 +195,8 @@ public struct Zensun {
         }
         return out
     }
-    
-    /// Calculate DNI using super sampling
-    public static func calculateBackwardsDNISupersampled(directRadiation: [Float], latitude: Float, longitude: Float, timerange: TimerangeDt, samples: Int = 60) -> [Float] {
-        // Shift timerange by dt and increase time resolution
-        let dtNew = timerange.dtSeconds / samples
-        let timeSuperSampled = timerange.range.add(-timerange.dtSeconds + dtNew).range(dtSeconds: dtNew)
-        let dhiBackwardsSuperSamled = directRadiation.interpolateSolarBackwards(timeOld: timerange, timeNew: timeSuperSampled, latitude: latitude, longitude: longitude, scalefactor: 1000)
-        
-        let averagedToInstant = backwardsAveragedToInstantFactor(time: timeSuperSampled, latitude: latitude, longitude: longitude)
-        let dhiSuperSamled = zip(dhiBackwardsSuperSamled, averagedToInstant).map(*)
-        
-        let dniSuperSampled = calculateInstantDNI(directRadiation: dhiSuperSamled, latitude: latitude, longitude: longitude, timerange: timeSuperSampled)
-        
-        /// return instant values
-        //return (0..<timerange.count).map { dhiBackwardsSuperSamled[Swift.min($0 * samples + samples, dhiBackwardsSuperSamled.count-1)] }
-        
-        let dni = dniSuperSampled.mean(by: samples)
-        
-        return dni
-    }
-    
-    /// Calculate DNI based on zenith angle
-    public static func calculateBackwardsDNI(directRadiation: [Float], latitude: Float, longitude: Float, timerange: TimerangeDt) -> [Float] {
-        //return calculateBackwardsDNISupersampled(directRadiation: directRadiation, latitude: latitude, longitude: longitude, timerange: timerange)
-        
-        return zip(directRadiation, timerange).map { (dhi, timestamp) in
-            if dhi.isNaN {
-                return .nan
-            }
-            if dhi <= 0 {
-                return 0
-            }
-            
-            /// DNI is typically limted to 85° zenith. We apply 5° to the parallax in addition to atmospheric refraction
-            /// The parallax is then use to limit integral coefficients to sun rise/set
-            let alpha = Float(0.83333 - 5).degreesToRadians
 
-            let decang = timestamp.getSunDeclination()
-            let eqtime = timestamp.getSunEquationOfTime()
-            
-            let latsun=decang
-            /// universal time
-            let ut = timestamp.hourWithFraction
-            let t1 = (90-latsun).degreesToRadians
-            
-            let lonsun = -15.0*(ut-12.0+eqtime)
-            
-            /// longitude of sun
-            let p1 = lonsun.degreesToRadians
-            
-            
-            let ut0 = ut - (Float(timerange.dtSeconds)/3600)
-            let lonsun0 = -15.0*(ut0-12.0+eqtime)
-            
-            let p10 = lonsun0.degreesToRadians
-            
-            let t0=(90-latitude).degreesToRadians
 
-            /// longitude of point
-            var p0 = longitude.degreesToRadians
-            if p0 < p1 - .pi {
-                p0 += 2 * .pi
-            }
-            if p0 > p1 + .pi {
-                p0 -= 2 * .pi
-            }
-
-            // limit p1 and p10 to sunrise/set
-            let arg = -(sin(alpha)+cos(t0)*cos(t1))/(sin(t0)*sin(t1))
-            let carg = arg > 1 || arg < -1 ? .pi : acos(arg)
-            let sunrise = p0 + carg
-            let sunset = p0 - carg
-            let p1_l = min(sunrise, p10)
-            let p10_l = max(sunset, p1)
-            
-            // solve integral to get sun elevation dt
-            // integral(cos(t0) cos(t1) + sin(t0) sin(t1) cos(p - p0)) dp = sin(t0) sin(t1) sin(p - p0) + p cos(t0) cos(t1) + constant
-            let left = sin(t0) * sin(t1) * sin(p1_l - p0) + p1_l * cos(t0) * cos(t1)
-            let right = sin(t0) * sin(t1) * sin(p10_l - p0) + p10_l * cos(t0) * cos(t1)
-            let zzBackwards = (left-right) / (p1_l - p10_l)
-            let dni = dhi / zzBackwards
-            // Prevent possible division by zero
-            // See https://github.com/open-meteo/open-meteo/discussions/395
-            if zzBackwards <= 0.0001 {
-                return dhi
-            }
-            return dni
-        }
-    }
-    
-    /// Calculate DNI based on zenith angle
-    public static func calculateInstantDNI(directRadiation: [Float], latitude: Float, longitude: Float, timerange: TimerangeDt) -> [Float] {
-        var out = [Float]()
-        out.reserveCapacity(directRadiation.count)
-        
-        for (dhi, timestamp) in zip(directRadiation, timerange) {
-            // direct horizontal irradiation
-            if dhi.isNaN {
-                out.append(.nan)
-                continue
-            }
-            if dhi <= 0 {
-                out.append(0)
-                continue
-            }
-
-            let decang = timestamp.getSunDeclination()
-            let eqtime = timestamp.getSunEquationOfTime()
-            
-            let latsun=decang
-            /// universal time
-            let ut = timestamp.hourWithFraction
-            let t1 = (90-latsun).degreesToRadians
-            
-            let lonsun = -15.0*(ut-12.0+eqtime)
-            
-            /// longitude of sun
-            let p1 = lonsun.degreesToRadians
-            let t0=(90-latitude).degreesToRadians
-
-            /// longitude of point
-            let p0 = longitude.degreesToRadians
-            let zz = cos(t0)*cos(t1)+sin(t0)*sin(t1)*cos(p1-p0)
-            if zz <= 0 {
-                out.append(0)
-                continue
-            }
-            let b = max(zz, cos(Float(85).degreesToRadians))
-            let dni = dhi / b
-            out.append(dni)
-        }
-        return out
-    }
-    
     /// Watt per square meter
     public static func extraTerrestrialRadiationBackwards(latitude: Float, longitude: Float, timerange: TimerangeDt) -> [Float] {
         // compute hourly mean radiation flux
@@ -444,6 +211,74 @@ public struct Zensun {
             max($0 * solarConstant, 0)
         }
     }
+    
+    
+    /// 2d field. Calculate scaling factor from backwards to instant radiation factor
+    public static func backwardsAveragedToInstantFactor(grid: Gridable, locationRange: Range<Int>, timerange: TimerangeDt) -> Array2DFastTime {
+        var out = Array2DFastTime(nLocations: locationRange.count, nTime: timerange.count)
+        
+        for (t, timestamp) in timerange.enumerated() {
+            /// fractional day number with 12am 1jan = 1
+            let decang = timestamp.getSunDeclination()
+            let eqtime = timestamp.getSunEquationOfTime()
+            
+            let alpha = Float(0.83333).degreesToRadians
+            
+            let latsun=decang
+            /// universal time
+            let ut = timestamp.hourWithFraction
+            let t1 = (90-latsun).degreesToRadians
+            
+            let lonsun = -15.0*(ut-12.0+eqtime)
+            
+            for (i, gridpoint) in locationRange.enumerated() {
+                let (latitude, longitude) = grid.getCoordinates(gridpoint: gridpoint)
+                /// longitude of sun
+                let p1 = lonsun.degreesToRadians
+                
+                let ut0 = ut - (Float(timerange.dtSeconds)/3600)
+                let lonsun0 = -15.0*(ut0-12.0+eqtime)
+                
+                let p10 = lonsun0.degreesToRadians
+                
+                let t0=(90-latitude).degreesToRadians                     // colatitude of point
+                
+                /// longitude of point
+                var p0 = longitude.degreesToRadians
+                if p0 < p1 - .pi {
+                    p0 += 2 * .pi
+                }
+                if p0 > p1 + .pi {
+                    p0 -= 2 * .pi
+                }
+                
+                // limit p1 and p10 to sunrise/set
+                let arg = -(sin(alpha)+cos(t0)*cos(t1))/(sin(t0)*sin(t1))
+                let carg = arg > 1 || arg < -1 ? .pi : acos(arg)
+                let sunrise = p0 + carg
+                let sunset = p0 - carg
+                let p1_l = min(sunrise, p10)
+                let p10_l = max(sunset, p1)
+                
+                // solve integral to get sun elevation dt
+                // integral(cos(t0) cos(t1) + sin(t0) sin(t1) cos(p - p0)) dp = sin(t0) sin(t1) sin(p - p0) + p cos(t0) cos(t1) + constant
+                let left = sin(t0) * sin(t1) * sin(p1_l - p0) + p1_l * cos(t0) * cos(t1)
+                let right = sin(t0) * sin(t1) * sin(p10_l - p0) + p10_l * cos(t0) * cos(t1)
+                /// sun elevation (`zz = sin(alpha)`)
+                let zzBackwards = (left-right) / (p1_l - p10_l)
+                
+                /// Instant sun elevation
+                let zzInstant = cos(t0)*cos(t1)+sin(t0)*sin(t1)*cos(p1-p0)
+                if zzBackwards <= 0 || zzInstant <= 0 {
+                    out[i, t] = 0
+                    continue
+                }
+                out[i, t] = zzInstant / zzBackwards
+            }
+        }
+        return out
+    }
+    
     
     /// Calculate scaling factor from backwards to instant radiation factor
     public static func backwardsAveragedToInstantFactor(time: TimerangeDt, latitude: Float, longitude: Float) -> [Float] {

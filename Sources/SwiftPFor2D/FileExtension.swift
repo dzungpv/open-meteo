@@ -3,16 +3,22 @@ import Foundation
 extension FileHandle {
     /// Create new file and convert it into a `FileHandle`. For some reason this does not exist in stock swift....
     /// Error on existing file
-    public static func createNewFile(file: String, size: Int? = nil) throws -> FileHandle {
+    public static func createNewFile(file: String, size: Int? = nil, sparseSize: Int? = nil) throws -> FileHandle {
         // 0644 permissions
         // O_TRUNC for overwrite
-        let fn = open(file, O_WRONLY | O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)
+        let fn = open(file, O_RDWR | O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)
         guard fn > 0 else {
             let error = String(cString: strerror(errno))
             throw SwiftPFor2DError.cannotOpenFile(filename: file, errno: errno, error: error)
         }
         
         let handle = FileHandle(fileDescriptor: fn, closeOnDealloc: true)
+        if let sparseSize {
+            guard ftruncate(fn, off_t(sparseSize)) == 0 else {
+                let error = String(cString: strerror(errno))
+                throw SwiftPFor2DError.cannotTruncateFile(filename: file, errno: errno, error: error)
+            }
+        }
         if let size {
             try handle.preAllocate(size: size)
         }
@@ -59,6 +65,19 @@ extension FileHandle {
         return handle
     }
     
+    /// Open file for read/write
+    public static func openFileReadWrite(file: String) throws -> FileHandle {
+        // 0644 permissions
+        // O_TRUNC for overwrite
+        let fn = open(file, O_RDWR, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)
+        guard fn > 0 else {
+            let error = String(cString: strerror(errno))
+            throw SwiftPFor2DError.cannotOpenFile(filename: file, errno: errno, error: error)
+        }
+        let handle = FileHandle(fileDescriptor: fn, closeOnDealloc: true)
+        return handle
+    }
+    
     /// Check if the file was deleted on the file system. Linux keep the file alive, as long as some processes have it open.
     public func wasDeleted() -> Bool {
         var stats = stat()
@@ -68,6 +87,37 @@ extension FileHandle {
         }
         // This field contains the number of hard links to the file.
         return stats.st_nlink == 0
+    }
+    
+    public func fileSize() -> Int {
+        var stats = stat()
+        guard fstat(fileDescriptor, &stats) != -1 else {
+            let error = String(cString: strerror(errno))
+            fatalError("fstat failed on open file descriptor. Error \(errno) \(error)")
+        }
+        return Int(stats.st_size)
+    }
+    
+    public func fileSizeAndModificationTime() -> (size: Int, modificationTime: Date, creationTime: Date) {
+        var stats = stat()
+        guard fstat(fileDescriptor, &stats) != -1 else {
+            let error = String(cString: strerror(errno))
+            fatalError("fstat failed on open file descriptor. Error \(errno) \(error)")
+        }
+        #if os(Linux)
+            let seconds = Double(stats.st_mtim.tv_sec)
+            let nanosends = Double(stats.st_mtim.tv_nsec)
+            let creationSeconds = Double(stats.st_ctim.tv_sec)
+            let creationNanosends = Double(stats.st_ctim.tv_nsec)
+        #else
+            let seconds = Double(stats.st_mtimespec.tv_sec)
+            let nanosends = Double(stats.st_mtimespec.tv_nsec)
+            let creationSeconds = Double(stats.st_ctimespec.tv_sec)
+            let creationNanosends = Double(stats.st_ctimespec.tv_nsec)
+        #endif
+        let mTime = Date(timeIntervalSince1970: seconds + nanosends / 1000)
+        let cTime = Date(timeIntervalSince1970: creationSeconds + creationNanosends / 1000)
+        return (Int(stats.st_size), mTime, cTime)
     }
 }
 

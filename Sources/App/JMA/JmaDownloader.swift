@@ -10,7 +10,7 @@ Jma Downloader
  - elevation download
  - 3h MSM pressue level data
  */
-struct JmaDownload: AsyncCommandFix {
+struct JmaDownload: AsyncCommand {
     struct Signature: CommandSignature {
         @Argument(name: "domain")
         var domain: String
@@ -29,6 +29,15 @@ struct JmaDownload: AsyncCommandFix {
         
         @Flag(name: "upper-level", help: "Download upper-level variables on pressure levels")
         var upperLevel: Bool
+        
+        @Option(name: "timeinterval", short: "t", help: "Timeinterval to download past forecasts. Format 20220101-20220131")
+        var timeinterval: String?
+
+        @Option(name: "concurrent", short: "c", help: "Numer of concurrent download/conversion jobs")
+        var concurrent: Int?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
     
     var help: String {
@@ -39,49 +48,41 @@ struct JmaDownload: AsyncCommandFix {
         let start = DispatchTime.now()
         let logger = context.application.logger
         let domain = try JmaDomain.load(rawValue: signature.domain)
-        
-        let run = try signature.run.flatMap(Timestamp.fromRunHourOrYYYYMMDD) ?? domain.lastRun
-
+        let nConcurrent = signature.concurrent ?? 1
         guard let server = signature.server else {
             fatalError("Parameter server required")
         }
+        try FileManager.default.createDirectory(atPath: domain.downloadDirectory, withIntermediateDirectories: true)
         
-        let variables: [JmaVariableDownloadable]
-        switch domain {
-        case .gsm:
-            variables = JmaSurfaceVariable.allCases.filter({$0 != .shortwave_radiation}) + domain.levels.flatMap {
-                level in JmaPressureVariableType.allCases.compactMap { variable in
-                    if variable == .relativehumidity && level <= 250 {
-                        return nil
-                    }
-                    return JmaPressureVariable(variable: variable, level: level)
-                }
+        if let timeinterval = signature.timeinterval {
+            for run in try Timestamp.parseRange(yyyymmdd: timeinterval).toRange(dt: 86400).with(dtSeconds: 86400 / 4) {
+                let handles = try await download(application: context.application, domain: domain, run: run, server: server, concurrent: nConcurrent)
+                try await GenericVariableHandle.convert(logger: logger, domain: domain, createNetcdf: signature.createNetcdf, run: run, nMembers: 1, handles: handles, concurrent: nConcurrent)
             }
-        case .msm:
-            variables = JmaSurfaceVariable.allCases
+            return
         }
         
-        logger.info("Downloading domain '\(domain.rawValue)' run '\(run.iso8601_YYYY_MM_dd_HH_mm)'")
-        
-        try FileManager.default.createDirectory(atPath: domain.downloadDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
-        
-        //try await downloadElevation(application: context.application, domain: domain)
-        try await download(application: context.application, domain: domain, run: run, server: server)
-        try convert(logger: logger, domain: domain, variables: variables, run: run, createNetcdf: signature.createNetcdf)
+        let run = try signature.run.flatMap(Timestamp.fromRunHourOrYYYYMMDD) ?? domain.lastRun
+        let handles = try await download(application: context.application, domain: domain, run: run, server: server, concurrent: nConcurrent)
+        try await GenericVariableHandle.convert(logger: logger, domain: domain, createNetcdf: signature.createNetcdf, run: run, nMembers: 1, handles: handles, concurrent: nConcurrent)
         logger.info("Finished in \(start.timeElapsedPretty())")
+
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            let variables = handles.map { $0.variable }.uniqued(on: { $0.rawValue })
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: variables)
+        }
     }
     
     /// MSM or GSM domain
-    func download(application: Application, domain: JmaDomain, run: Timestamp, server: String) async throws {
+    /// Return open file handles, to ensure overlapping runs are not conflicting
+    func download(application: Application, domain: JmaDomain, run: Timestamp, server: String, concurrent: Int) async throws -> [GenericVariableHandle] {
         let logger = application.logger
-        let deadLineHours: Double = domain == .gsm ? 2.9 : 4
+        logger.info("Downloading domain '\(domain.rawValue)' run '\(run.iso8601_YYYY_MM_dd_HH_mm)'")
+        let deadLineHours: Double = domain == .gsm ? 3 : 6
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient, deadLineHours: deadLineHours)
-        
-        let nLocationsPerChunk = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil).nLocationsPerChunk
+        Process.alarm(seconds: Int(deadLineHours + 1) * 3600)
+        let nLocationsPerChunk = OmFileSplitter(domain).nLocationsPerChunk
         let writer = OmFileWriter(dim0: 1, dim1: domain.grid.count, chunk0: 1, chunk1: nLocationsPerChunk)
-        
-        var grib2d = GribArray2D(nx: domain.grid.nx, ny: domain.grid.ny)
         
         let runDate = run.toComponents()
         let server = server.replacingOccurrences(of: "YYYY", with: runDate.year.zeroPadded(len: 4))
@@ -92,101 +93,72 @@ struct JmaDownload: AsyncCommandFix {
         let filesToDownload: [String]
         switch domain {
         case .gsm:
-            filesToDownload = domain.forecastHours(run: run.hour).map { hour in
+            filesToDownload = domain.forecastHours(run: run).map { hour in
                 "Z__C_RJTD_\(run.format_YYYYMMddHH)0000_GSM_GPV_Rgl_FD\((hour/24).zeroPadded(len: 2))\((hour%24).zeroPadded(len: 2))_grib2.bin"
             }
         case .msm:
             // 0 und 12z run have more data
-            let range = run.hour % 12 == 0 ? ["00-15", "16-33", "34-39", "40-51", "52-78"] : ["00-15", "16-33", "34-39"]
+            let runc = run.toComponents()
+            let after2022july = (runc.year >= 2022 && runc.month >= 7) || runc.year >= 2023
+            let range = (run.hour % 12 == 0 && after2022july) ? ["00-15", "16-33", "34-39", "40-51", "52-78"] : ["00-15", "16-33", "34-39"]
             filesToDownload = range.map { hour in
                 "Z__C_RJTD_\(run.format_YYYYMMddHH)0000_MSM_GPV_Rjp_Lsurf_FH\(hour)_grib2.bin"
             }
         }
         
-        for filename in filesToDownload {
-            for message in try await curl.downloadGrib(url: "\(server)\(filename)", bzip2Decode: false) {
-                guard let variable = message.toJmaVariable(),
-                      let hour = message.get(attribute: "endStep").flatMap(Int.init) else {
-                    continue
-                }
-                try grib2d.load(message: message)
-                if domain.isGlobal {
-                    grib2d.array.shift180LongitudeAndFlipLatitude()
-                } else {
-                    grib2d.array.flipLatitude()
-                }
-                
-                // Scaling before compression with scalefactor
-                if let fma = variable.multiplyAdd {
-                    grib2d.array.data.multiplyAdd(multiply: fma.multiply, add: fma.add)
-                }
-                
-                //try data.writeNetcdf(filename: "\(domain.downloadDirectory)\(variable.variable.omFileName.file)_\(variable.hour).nc")
-                let file = "\(domain.downloadDirectory)\(variable.omFileName.file)_\(hour).om"
-                try FileManager.default.removeItemIfExists(at: file)
-                
-                logger.info("Compressing and writing data to \(variable.omFileName.file)_\(hour).om")
-                //let compression = variable.isAveragedOverForecastTime || variable.isAccumulatedSinceModelStart ? CompressionType.fpxdec32 : .p4nzdec256
-                try writer.write(file: file, compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data)
+        /// Keep values from previous timestep. Actori isolated, because of concurrent data conversion
+        let deaverager = GribDeaverager()
+        
+        let handles = try await filesToDownload.asyncFlatMap { filename -> [GenericVariableHandle] in
+            let url = "\(server)\(filename)"
+            return try await curl.withGribStream(url: url, bzip2Decode: false, nConcurrent: concurrent) { stream in
+                return try await stream.mapStream(nConcurrent: concurrent) { message -> GenericVariableHandle? in
+                    guard let variable = message.toJmaVariable(),
+                          let stepRange = message.get(attribute: "stepRange"),
+                          let stepType = message.get(attribute: "stepType"),
+                          let hour = message.get(attribute: "endStep").flatMap(Int.init) else {
+                        return nil
+                    }
+                    if hour == 0 && variable.skipHour0 {
+                        return nil
+                    }
+                    let timestamp = run.add(hours: hour)
+                    var grib2d = GribArray2D(nx: domain.grid.nx, ny: domain.grid.ny)
+                    try grib2d.load(message: message)
+                    if domain.isGlobal {
+                        grib2d.array.shift180LongitudeAndFlipLatitude()
+                    } else {
+                        grib2d.array.flipLatitude()
+                    }
+                    
+                    // Scaling before compression with scalefactor
+                    if let fma = variable.multiplyAdd {
+                        grib2d.array.data.multiplyAdd(multiply: fma.multiply, add: fma.add)
+                    }
+                    
+                    // Deaccumulate precipitation. MSM model falsely marks `stepType` as accumulation for precipitation, resulting in negative values
+                    if domain != .msm {
+                        guard await deaverager.deaccumulateIfRequired(variable: variable, member: 0, stepType: stepType, stepRange: stepRange, grib2d: &grib2d) else {
+                            return nil
+                        }
+                    }
+                    
+                    //try data.writeNetcdf(filename: "\(domain.downloadDirectory)\(variable.variable.omFileName.file)_\(variable.hour).nc")
+                    logger.info("Compressing and writing data to \(variable.omFileName.file)_\(hour).om")
+                    let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data)
+                    return GenericVariableHandle(variable: variable, time: timestamp, member: 0, fn: fn, skipHour0: variable.skipHour0)
+                }.collect().compactMap({$0})
             }
         }
-        curl.printStatistics()
-    }
-    
-    /// Process each variable and update time-series optimised files
-    func convert(logger: Logger, domain: JmaDomain, variables: [JmaVariableDownloadable], run: Timestamp, createNetcdf: Bool) throws {
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil)
-        let nLocationsPerChunk = om.nLocationsPerChunk
-        let forecastHours = domain.forecastHours(run: run.hour)
-        let nTime = forecastHours.max()! / domain.dtHours + 1
-        let time = TimerangeDt(start: run, nTime: nTime, dtSeconds: domain.dtSeconds)
-        
-        let grid = domain.grid
-        let nLocations = grid.count
-        
-        var data2d = Array2DFastTime(nLocations: nLocationsPerChunk, nTime: nTime)
-        var readTemp = [Float](repeating: .nan, count: nLocationsPerChunk)
-        
-        for variable in variables {
-            let skip = variable.skipHour0 ? 1 : 0
-            let progress = ProgressTracker(logger: logger, total: nLocations, label: "Convert \(variable.rawValue)")
-            
-            let readers: [(hour: Int, reader: OmFileReader<MmapFile>)] = try forecastHours.compactMap({ hour in
-                if hour == 0 && variable.skipHour0 {
-                    return nil
-                }
-                let reader = try OmFileReader(file: "\(domain.downloadDirectory)\(variable.omFileName.file)_\(hour).om")
-                try reader.willNeed()
-                return (hour, reader)
-            })
-            
-            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, indexTime: time.toIndexTime(), skipFirst: skip, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor) { d0offset in
-                
-                let locationRange = d0offset ..< min(d0offset+nLocationsPerChunk, nLocations)
-                data2d.data.fillWithNaNs()
-                for reader in readers {
-                    try reader.reader.read(into: &readTemp, arrayRange: 0..<locationRange.count, arrayDim1Length: locationRange.count, dim0Slow: 0..<1, dim1: locationRange)
-                    data2d[0..<data2d.nLocations, reader.hour / domain.dtHours] = readTemp
-                }
-                
-                // De-accumulate precipitation
-                // Precipitation in MSM is not accumulated
-                if variable.isAccumulatedSinceModelStart && domain != .msm {
-                    data2d.deaccumulateOverTime()
-                }
-                
-                progress.add(locationRange.count)
-                return data2d.data[0..<locationRange.count * nTime]
-            }
-            progress.finish()
-        }
+        await curl.printStatistics()
+        Process.alarm(seconds: 0)
+        return handles
     }
 }
 
 protocol JmaVariableDownloadable: GenericVariable {
     var multiplyAdd: (multiply: Float, add: Float)? { get }
     var skipHour0: Bool { get }
-    var isAccumulatedSinceModelStart: Bool { get }
 }
 
 extension GribMessage {
@@ -211,14 +183,14 @@ extension GribMessage {
         case "10u": return JmaSurfaceVariable.wind_u_component_10m
         case "10v": return JmaSurfaceVariable.wind_v_component_10m
         case "2t": return JmaSurfaceVariable.temperature_2m
-        case "2r": return JmaSurfaceVariable.relativehumidity_2m
-        case "lcc": return JmaSurfaceVariable.cloudcover_low
-        case "mcc": return JmaSurfaceVariable.cloudcover_mid
-        case "hcc": return JmaSurfaceVariable.cloudcover_high
-        case "dswrf": return JmaSurfaceVariable.shortwave_radiation
+        case "2r": return JmaSurfaceVariable.relative_humidity_2m
+        case "lcc": return JmaSurfaceVariable.cloud_cover_low
+        case "mcc": return JmaSurfaceVariable.cloud_cover_mid
+        case "hcc": return JmaSurfaceVariable.cloud_cover_high
+        case "dswrf", "msdwswrf": return JmaSurfaceVariable.shortwave_radiation
         case "unknown":
             if parameterCategory == 6 && parameterNumber == 1 {
-                return JmaSurfaceVariable.cloudcover
+                return JmaSurfaceVariable.cloud_cover
             }
             if parameterCategory == 1 && parameterNumber == 8 {
                 return JmaSurfaceVariable.precipitation
@@ -235,9 +207,9 @@ extension GribMessage {
         case "w": return JmaPressureVariable(variable: .vertical_velocity, level: level)
         case "r":
             if level == 2 { // MSM case
-                return JmaSurfaceVariable.relativehumidity_2m
+                return JmaSurfaceVariable.relative_humidity_2m
             }
-            return JmaPressureVariable(variable: .relativehumidity, level: level)
+            return JmaPressureVariable(variable: .relative_humidity, level: level)
         default: return nil
         }
     }
@@ -245,12 +217,12 @@ extension GribMessage {
 
 enum JmaSurfaceVariable: String, CaseIterable, JmaVariableDownloadable, GenericVariableMixable {
     case temperature_2m
-    case cloudcover
-    case cloudcover_low
-    case cloudcover_mid
-    case cloudcover_high
+    case cloud_cover
+    case cloud_cover_low
+    case cloud_cover_mid
+    case cloud_cover_high
     case pressure_msl
-    case relativehumidity_2m
+    case relative_humidity_2m
     
     /// not in global model
     case shortwave_radiation
@@ -261,32 +233,35 @@ enum JmaSurfaceVariable: String, CaseIterable, JmaVariableDownloadable, GenericV
     /// accumulated since forecast start
     case precipitation
     
-    var omFileName: (file: String, level: Int) {
-        return (rawValue, 0)
+    var storePreviousForecast: Bool {
+        switch self {
+        case .temperature_2m, .relative_humidity_2m: return true
+        case .precipitation: return true
+        case .pressure_msl: return true
+        case .cloud_cover: return true
+        case .shortwave_radiation: return true
+        case .wind_v_component_10m, .wind_u_component_10m: return true
+        default: return false
+        }
     }
     
-    var isAccumulatedSinceModelStart: Bool {
-        switch self {
-        case .precipitation:
-            return true
-        default:
-            return false
-        }
+    var omFileName: (file: String, level: Int) {
+        return (rawValue, 0)
     }
     
     var scalefactor: Float {
         switch self {
         case .temperature_2m:
             return 20
-        case .cloudcover:
+        case .cloud_cover:
             return 1
-        case .cloudcover_low:
+        case .cloud_cover_low:
             return 1
-        case .cloudcover_mid:
+        case .cloud_cover_mid:
             return 1
-        case .cloudcover_high:
+        case .cloud_cover_high:
             return 1
-        case .relativehumidity_2m:
+        case .relative_humidity_2m:
             return 1
         case .precipitation:
             return 10
@@ -316,17 +291,17 @@ enum JmaSurfaceVariable: String, CaseIterable, JmaVariableDownloadable, GenericV
         switch self {
         case .temperature_2m:
             return .hermite(bounds: nil)
-        case .cloudcover:
+        case .cloud_cover:
             return .hermite(bounds: 0...100)
-        case .cloudcover_low:
+        case .cloud_cover_low:
             return .hermite(bounds: 0...100)
-        case .cloudcover_mid:
+        case .cloud_cover_mid:
             return .hermite(bounds: 0...100)
-        case .cloudcover_high:
+        case .cloud_cover_high:
             return .hermite(bounds: 0...100)
         case .pressure_msl:
             return .hermite(bounds: nil)
-        case .relativehumidity_2m:
+        case .relative_humidity_2m:
             return .hermite(bounds: 0...100)
         case .wind_v_component_10m:
             return .hermite(bounds: nil)
@@ -343,26 +318,26 @@ enum JmaSurfaceVariable: String, CaseIterable, JmaVariableDownloadable, GenericV
         switch self {
         case .temperature_2m:
             return .celsius
-        case .cloudcover:
-            return .percent
-        case .cloudcover_low:
-            return .percent
-        case .cloudcover_mid:
-            return .percent
-        case .cloudcover_high:
-            return .percent
-        case .relativehumidity_2m:
-            return .percent
+        case .cloud_cover:
+            return .percentage
+        case .cloud_cover_low:
+            return .percentage
+        case .cloud_cover_mid:
+            return .percentage
+        case .cloud_cover_high:
+            return .percentage
+        case .relative_humidity_2m:
+            return .percentage
         case .precipitation:
-            return .millimeter
+            return .millimetre
         case .pressure_msl:
-            return .hectoPascal
+            return .hectopascal
         case .wind_v_component_10m:
-            return .ms
+            return .metrePerSecond
         case .wind_u_component_10m:
-            return .ms
+            return .metrePerSecond
         case .shortwave_radiation:
-            return .wattPerSquareMeter
+            return .wattPerSquareMetre
         }
     }
     
@@ -392,7 +367,7 @@ enum JmaPressureVariableType: String, CaseIterable {
     case wind_v_component
     case geopotential_height
     case vertical_velocity
-    case relativehumidity
+    case relative_humidity
 }
 
 
@@ -403,16 +378,16 @@ struct JmaPressureVariable: PressureVariableRespresentable, JmaVariableDownloada
     let variable: JmaPressureVariableType
     let level: Int
     
+    var storePreviousForecast: Bool {
+        return false
+    }
+    
     var requiresOffsetCorrectionForMixing: Bool {
         return false
     }
     
     var omFileName: (file: String, level: Int) {
         return (rawValue, 0)
-    }
-    
-    var isAccumulatedSinceModelStart: Bool {
-        return false
     }
     
     var scalefactor: Float {
@@ -430,7 +405,7 @@ struct JmaPressureVariable: PressureVariableRespresentable, JmaVariableDownloada
             return (0.05..<1).interpolated(atFraction: (0..<500).fraction(of: Float(level)))
         case .vertical_velocity:
             return (10..<15).interpolated(atFraction: (0..<800).fraction(of: Float(level)))
-        case .relativehumidity:
+        case .relative_humidity:
             return (0.2..<1).interpolated(atFraction: (0..<800).fraction(of: Float(level)))
         }
     }
@@ -447,7 +422,7 @@ struct JmaPressureVariable: PressureVariableRespresentable, JmaVariableDownloada
             return .hermite(bounds: nil)
         case .vertical_velocity:
             return .hermite(bounds: nil)
-        case .relativehumidity:
+        case .relative_humidity:
             return .hermite(bounds: 0...100)
         }
     }
@@ -469,15 +444,15 @@ struct JmaPressureVariable: PressureVariableRespresentable, JmaVariableDownloada
         case .temperature:
             return .celsius
         case .wind_u_component:
-            return .ms
+            return .metrePerSecond
         case .wind_v_component:
-            return .ms
+            return .metrePerSecond
         case .geopotential_height:
-            return .meter
+            return .metre
         case .vertical_velocity:
-            return .ms
-        case .relativehumidity:
-            return .percent
+            return .metrePerSecond
+        case .relative_humidity:
+            return .percentage
         }
     }
     
@@ -499,16 +474,24 @@ enum JmaDomain: String, GenericDomain, CaseIterable {
     case gsm
     case msm
     
-    var omfileDirectory: String {
-        return "\(OpenMeteo.dataDictionary)omfile-\(rawValue)/"
+    var domainRegistry: DomainRegistry {
+        switch self {
+        case .gsm:
+            return .jma_gsm
+        case .msm:
+            return .jma_msm
+        }
     }
-    var downloadDirectory: String {
-        return "\(OpenMeteo.dataDictionary)download-\(rawValue)/"
+    
+    var domainRegistryStatic: DomainRegistry? {
+        return domainRegistry
     }
-    var omfileArchive: String? {
-        return nil
+    
+    var hasYearlyFiles: Bool {
+        return false
     }
-    var omFileMaster: (path: String, time: TimerangeDt)? {
+
+    var masterTimeRange: Range<Timestamp>? {
         return nil
     }
     
@@ -520,23 +503,6 @@ enum JmaDomain: String, GenericDomain, CaseIterable {
     }
     var isGlobal: Bool {
         return self == .gsm
-    }
-
-    private static var gsmElevationFile = try? OmFileReader(file: Self.gsm.surfaceElevationFileOm)
-    private static var msmElevationFile = try? OmFileReader(file: Self.msm.surfaceElevationFileOm)
-    
-    func getStaticFile(type: ReaderStaticVariable) -> OmFileReader<MmapFile>? {
-        switch type {
-        case .soilType:
-            return nil
-        case .elevation:
-            switch self {
-            case .gsm:
-                return Self.gsmElevationFile
-            case .msm:
-                return Self.msmElevationFile
-            }
-        }
     }
     
     /// Based on the current time , guess the current run that should be available soon on the open-data server
@@ -554,18 +520,20 @@ enum JmaDomain: String, GenericDomain, CaseIterable {
         }
     }
     
-    /// Filename of the surface elevation file
-    var surfaceElevationFileOm: String {
-        "\(omfileDirectory)HSURF.om"
-    }
-    
-    func forecastHours(run: Int) -> [Int] {
+    func forecastHours(run: Timestamp) -> [Int] {
+        let hour = run.hour
         switch self {
         case .gsm:
-            let through = run == 00 || run == 12 ? 264 : 136
+            if run.toComponents().year <= 2018 {
+                return Array(stride(from: 0, through: 84, by: 6))
+            }
+            if run.toComponents().year <= 2020 {
+                return Array(stride(from: 0, through: 134, by: 6))
+            }
+            let through = hour == 00 || hour == 12 ? 264 : 136
             return Array(stride(from: 0, through: through, by: 6))
         case .msm:
-            let through = run == 00 || run == 12 ? 78 : 39
+            let through = hour == 00 || hour == 12 ? 78 : 39
             return Array(stride(from: 0, through: through, by: 1))
         }
     }

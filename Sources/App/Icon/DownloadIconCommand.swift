@@ -8,7 +8,7 @@ import CHelper
  TODO:
  - Elevation files should not mask out sea level locations -> this breaks surface pressure correction as a lake can be above sea level
  */
-struct DownloadIconCommand: AsyncCommandFix {
+struct DownloadIconCommand: AsyncCommand {
     enum VariableGroup: String, RawRepresentable, CaseIterable {
         case all
         case surface
@@ -25,14 +25,20 @@ struct DownloadIconCommand: AsyncCommandFix {
         @Option(name: "run")
         var run: String?
 
-        @Flag(name: "skip-existing", help: "ONLY FOR TESTING! Do not use in production. May update the database with stale data")
-        var skipExisting: Bool
+        @Option(name: "concurrent", short: "c", help: "Numer of concurrent download/conversion jobs")
+        var concurrent: Int?
+        
+        @Flag(name: "create-netcdf")
+        var createNetcdf: Bool
         
         @Option(name: "group")
         var group: String?
         
         @Option(name: "only-variables")
         var onlyVariables: String?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
 
     var help: String {
@@ -44,13 +50,13 @@ struct DownloadIconCommand: AsyncCommandFix {
      */
     func convertSurfaceElevation(application: Application, domain: IconDomains, run: Timestamp) async throws {
         let logger = application.logger
-        if FileManager.default.fileExists(atPath: domain.surfaceElevationFileOm) {
+        let surfaceElevationFileOm = domain.surfaceElevationFileOm.getFilePath()
+        if FileManager.default.fileExists(atPath: surfaceElevationFileOm) {
             return
         }
         
         let downloadDirectory = domain.downloadDirectory
         try FileManager.default.createDirectory(atPath: downloadDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
         
         let deadLineHours: Double = (domain == .iconD2 || domain == .iconD2Eps) ? 2 : 5
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient, deadLineHours: deadLineHours)
@@ -87,18 +93,20 @@ struct DownloadIconCommand: AsyncCommandFix {
             }
         }
         
-        try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 20, chunk1: 20).write(file: domain.surfaceElevationFileOm, compressionType: .p4nzdec256, scalefactor: 1, all: hsurf)
+        try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 20, chunk1: 20).write(file: surfaceElevationFileOm, compressionType: .p4nzdec256, scalefactor: 1, all: hsurf)
     }
     
     
     /// Download ICON global, eu and d2 *.grid2.bz2 files
-    func downloadIcon(application: Application, domain: IconDomains, run: Timestamp, skipFilesIfExisting: Bool, variables: [IconVariableDownloadable]) async throws {
+    func downloadIcon(application: Application, domain: IconDomains, run: Timestamp, variables: [IconVariableDownloadable]) async throws -> (handles: [GenericVariableHandle], handles15minIconD2: [GenericVariableHandle]) {
         let logger = application.logger
         let downloadDirectory = domain.downloadDirectory
         try FileManager.default.createDirectory(atPath: downloadDirectory, withIntermediateDirectories: true)
         
         let deadLineHours: Double = (domain == .iconD2 || domain == .iconD2Eps) ? 2 : 5
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient, deadLineHours: deadLineHours, waitAfterLastModified: 120)
+        Process.alarm(seconds: Int(deadLineHours + 1) * 3600)
+        defer { Process.alarm(seconds: 0) }
         
         let domainPrefix = "\(domain.rawValue)_\(domain.region)"
         let cdo = try await CdoHelper(domain: domain, logger: logger, curl: curl)
@@ -110,11 +118,16 @@ struct DownloadIconCommand: AsyncCommandFix {
         let dateStr = run.format_YYYYMMddHH
 
         let nMembers = domain.ensembleMembers
-        let nLocationsPerChunk = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil, chunknLocations: nMembers > 1 ? nMembers : nil).nLocationsPerChunk
+        let nLocationsPerChunk = OmFileSplitter(domain, nMembers: nMembers, chunknLocations: nMembers > 1 ? nMembers : nil).nLocationsPerChunk
         
         let writer = OmFileWriter(dim0: 1, dim1: domain.grid.count, chunk0: 1, chunk1: nLocationsPerChunk)
         
         var grib2d = GribArray2D(nx: domain.grid.nx, ny: domain.grid.ny)
+        var handles = [GenericVariableHandle]()
+        var handles15minIconD2 = [GenericVariableHandle]()
+        
+        let deaverager = GribDeaverager()
+        let deaverager15min = GribDeaverager()
         
         /// Domain elevation field. Used to calculate sea level pressure from surface level pressure in ICON EPS and ICON EU EPS
         lazy var domainElevation = {
@@ -127,10 +140,14 @@ struct DownloadIconCommand: AsyncCommandFix {
         let forecastSteps = domain.getDownloadForecastSteps(run: run.hour)
         for hour in forecastSteps {
             logger.info("Downloading hour \(hour)")
+            let timestamp = run.add(hours: hour)
             let h3 = hour.zeroPadded(len: 3)
             
             /// Keep temperature 2m in memory if required for sea level pressure conversion
             var temperature2m = [Int: Array2D]()
+            
+            /// Keep precipitation in memory to correct weather codes
+            var precipitation = [Int: Array2D]()
             
             for variable in variables {
                 if variable.skipHour(hour: hour, domain: domain, forDownload: true, run: run) {
@@ -145,175 +162,141 @@ struct DownloadIconCommand: AsyncCommandFix {
                 
                 let url = "\(serverPrefix)\(v.variable)/\(filenameFrom)"
                 
-                let filenameDest = "single-level_\(h3)_\(variable.omFileName.file.uppercased()).fpg"
-                if skipFilesIfExisting && FileManager.default.fileExists(atPath: "\(downloadDirectory)\(filenameDest)") {
-                    continue
-                }
-                
                 var messages = try await cdo.downloadAndRemap(url)
                 if domain == .iconD2 && messages.count > 1 {
                     // Write 15min D2 icon data
                     let downloadDirectory = IconDomains.iconD2_15min.downloadDirectory
                     try FileManager.default.createDirectory(atPath: downloadDirectory, withIntermediateDirectories: true)
                     for (i, message) in messages.enumerated() {
-                        let h3 = (hour*4+i).zeroPadded(len: 3)
-                        let filenameDest = "single-level_\(h3)_\(variable.omFileName.file.uppercased()).fpg"
-                        try grib2d.load(message: message)
-                        var data = grib2d.array.data
-                        try FileManager.default.removeItemIfExists(at: "\(downloadDirectory)\(filenameDest)")
-                        if let fma = variable.multiplyAdd {
-                            data.multiplyAdd(multiply: fma.multiply, add: fma.add)
+                        guard let stepRange = message.get(attribute: "stepRange"),
+                              let stepType = message.get(attribute: "stepType") else {
+                            fatalError("could not get step range or type")
                         }
-                        let compression = variable.isAveragedOverForecastTime || variable.isAccumulatedSinceModelStart ? CompressionType.fpxdec32 : .p4nzdec256
-                        try writer.write(file: "\(downloadDirectory)\(filenameDest)", compressionType: compression, scalefactor: variable.scalefactor, all: data)
+                        let timestamp = run.add(hour*3600 + i*900)
+                        try grib2d.load(message: message)
+                        if let fma = variable.multiplyAdd {
+                            grib2d.array.data.multiplyAdd(multiply: fma.multiply, add: fma.add)
+                        }
+                        // Deaccumulate precipitation
+                        guard await deaverager15min.deaccumulateIfRequired(variable: variable, member: 0, stepType: stepType, stepRange: stepRange, grib2d: &grib2d) else {
+                            continue
+                        }
+                        let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data)
+                        handles15minIconD2.append(GenericVariableHandle(
+                            variable: variable,
+                            time: timestamp,
+                            member: 0,
+                            fn: fn,
+                            skipHour0: variable.skipHour(hour: 0, domain: domain, forDownload: false, run: run)
+                        ))
                     }
                     messages = [messages[0]]
                 }
                 
                 // Contains more than 1 message for ensemble models
-                for (i, message) in messages.enumerated() {
+                for (member, message) in messages.enumerated() {
                     try grib2d.load(message: message)
-                    let memberStr = i > 0 ? "_\(i)" : ""
-                    let filenameDest = "single-level_\(h3)_\(variable.omFileName.file.uppercased())\(memberStr).fpg"
-                    
-                    // Write data as encoded floats to disk
-                    try FileManager.default.removeItemIfExists(at: "\(downloadDirectory)\(filenameDest)")
                     
                     // Scaling before compression with scalefactor
                     if let fma = variable.multiplyAdd {
                         grib2d.array.data.multiplyAdd(multiply: fma.multiply, add: fma.add)
                     }
                     
+                    guard let stepRange = message.get(attribute: "stepRange"),
+                          let stepType = message.get(attribute: "stepType") else {
+                        fatalError("could not get step range or type")
+                    }
+                    
+                    // Deaccumulate precipitation
+                    guard await deaverager.deaccumulateIfRequired(variable: variable, member: member, stepType: stepType, stepRange: stepRange, grib2d: &grib2d) else {
+                        continue
+                    }
+                    
                     if let variable = variable as? IconSurfaceVariable {
+                        if variable == .precipitation {
+                            precipitation[member] = grib2d.array
+                        }
+                        if variable == .temperature_2m {
+                            // store in memory for this member
+                            temperature2m[member] = grib2d.array
+                        }
                         if [.iconEps, .iconEuEps].contains(domain) {
-                            if variable == .temperature_2m {
-                                // store in memory for this member
-                                temperature2m[i] = grib2d.array
-                            }
                             if variable == .pressure_msl {
                                 // ICON EPC is actually downloading surface level pressure
                                 // calculate sea level presure using temperature and elevation
-                                guard let t2m = temperature2m[i] else {
+                                guard let t2m = temperature2m[member] else {
                                     fatalError("Sea level pressure calculation required temperature 2m")
                                 }
                                 grib2d.array.data = Meteorology.sealevelPressureSpatial(temperature: t2m.data, pressure: grib2d.array.data, elevation: domainElevation)
                             }
                         }
-                        if domain == .iconEps && variable == .relativehumidity_2m {
+                        if domain == .iconEps && variable == .relative_humidity_2m {
                             // ICON EPS is using dewpoint, convert to relative humidity
-                            guard let t2m = temperature2m[i] else {
-                                fatalError("Relative humidity calculation requires temperature 2m")
+                            guard let t2m = temperature2m[member] else {
+                                fatalError("Relative humidity calculation requires temperature_2m")
                             }
                             grib2d.array.data.multiplyAdd(multiply: 1, add: -273.15)
                             grib2d.array.data = zip(t2m.data, grib2d.array.data).map(Meteorology.relativeHumidity)
                         }
+                        // DWD ICON weather codes show rain although precipitation is 0
+                        // Similar for snow at +2°C or more
+                        if variable == .weather_code {
+                            guard let t2m = temperature2m[member] else {
+                                fatalError("Weather code correction requires temperature_2m")
+                            }
+                            guard let precip = precipitation[member] else {
+                                fatalError("Weather code correction requires precipitation")
+                            }
+                            for i in grib2d.array.data.indices {
+                                guard let weathercode = WeatherCode(rawValue: Int(grib2d.array.data[i])) else {
+                                    continue
+                                }
+                                grib2d.array.data[i] = Float(weathercode.correctDwdIconWeatherCode(
+                                    temperature_2m: t2m.data[i],
+                                    precipitation: precip.data[i]
+                                ).rawValue)
+                            }
+                        }
+                        
+                        /// Lower freezing level height below grid-cell elevation to adjust data to mixed terrain
+                        /// Use temperature to esimate freezing level height below ground. This is consistent with GFS
+                        /// https://github.com/open-meteo/open-meteo/issues/518#issuecomment-1827381843
+                        if variable == .freezing_level_height {
+                            guard let t2m = temperature2m[member] else {
+                                fatalError("Freezing level height correction requires temperature_2m")
+                            }
+                            for i in grib2d.array.data.indices {
+                                let freezingLevelHeight = grib2d.array.data[i]
+                                let temperature_2m = t2m.data[i]
+                                let newHeight = freezingLevelHeight - abs(-1 * temperature_2m) * 0.7 * 100
+                                if newHeight <= domainElevation[i] {
+                                    grib2d.array.data[i] = newHeight
+                                }
+                            }
+                        }
                     }
-                    
-                    //try grib2d.array.writeNetcdf(filename: "\(downloadDirectory)\(variable.omFileName.file)\(memberStr)_\(h3).nc")
-                    
                     //logger.info("Compressing and writing data to \(filenameDest)")
-                    let compression = variable.isAveragedOverForecastTime || variable.isAccumulatedSinceModelStart ? CompressionType.fpxdec32 : .p4nzdec256
-                    try writer.write(file: "\(downloadDirectory)\(filenameDest)", compressionType: compression, scalefactor: variable.scalefactor, all: grib2d.array.data)
+                    let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data)
+                    handles.append(GenericVariableHandle(
+                        variable: variable,
+                        time: timestamp,
+                        member: member,
+                        fn: fn,
+                        skipHour0: variable.skipHour(hour: 0, domain: domain, forDownload: false, run: run)
+                    ))
                 }
                 // icon global downloads tend to use a lot of memory due to numerous allocations
                 chelper_malloc_trim()
             }
         }
-        curl.printStatistics()
-    }
-
-    /// unompress and remap
-    /// Process variable after variable
-    func convertIcon(logger: Logger, domain: IconDomains, run: Timestamp, variables: [IconVariableDownloadable]) throws {
-        let downloadDirectory = domain.downloadDirectory
-        let grid = domain.grid
-        let nMembers = domain.ensembleMembers
-        
-        let forecastSteps = domain.getDownloadForecastSteps(run: run.hour)
-        let nTime = forecastSteps.max()! * 3600 / domain.dtSeconds + 1
-        let time = TimerangeDt(start: run, nTime: nTime, dtSeconds: domain.dtSeconds)
-        let nLocations = grid.count
-        
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: nLocations * nMembers, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil, chunknLocations: nMembers > 1 ? nMembers : nil)
-        let nLocationsPerChunk = om.nLocationsPerChunk
-        //print("nLocationsPerChunk \(nLocationsPerChunk)... \(nLocations/nLocationsPerChunk) iterations")
-
-        // ICON global + eu only have 3h data after 78 hours
-        // ICON global 6z and 18z have 120 instead of 180 forecast hours
-        // Stategy: Read each variable in a spatial array and interpolate missing values
-        // Afterwards merge into temporal data files
-        
-        var data3d = Array3DFastTime(nLocations: nLocationsPerChunk, nLevel: nMembers, nTime: nTime)
-        var readTemp = [Float](repeating: .nan, count: nLocationsPerChunk)
-
-        for variable in variables {
-            guard variable.getVarAndLevel(domain: domain) != nil else {
-                continue
-            }
-            let v = variable.omFileName.file.uppercased()
-            let skip = variable.skipHour(hour: 0, domain: domain, forDownload: false, run: run) ? 1 : 0
-            
-            // For ICON-EPS, `direct radiation` only contains 3-hourly data. Remove them from `forecastSteps` for interpolation
-            let forecastSteps = forecastSteps.filter({
-                $0 == 0 || !variable.skipHour(hour: $0, domain: domain, forDownload: false, run: run)
-            })
-            
-            let progress = ProgressTracker(logger: logger, total: nLocations * nMembers, label: "Convert \(variable.rawValue)")
-            
-            let readers: [(hour: Int, reader: [OmFileReader<MmapFile>])] = try forecastSteps.compactMap({ hour in
-                if hour < skip {
-                    return nil
-                }
-                let readers = try (0..<nMembers).map { member in
-                    let memberStr = member > 0 ? "_\(member)" : ""
-                    return try OmFileReader(file: "\(downloadDirectory)single-level_\(hour.zeroPadded(len: 3))_\(v)\(memberStr).fpg")
-                }
-                return (hour, readers)
-            })
-            
-            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, indexTime: time.toIndexTime(), skipFirst: skip, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor) { offset in
-                let d0offset = offset / nMembers
-                
-                let locationRange = d0offset ..< min(d0offset+nLocationsPerChunk, nLocations)
-                data3d.data.fillWithNaNs()
-                for reader in readers {
-                    for (i, memberReader) in reader.reader.enumerated() {
-                        try memberReader.read(into: &readTemp, arrayDim1Range: 0..<locationRange.count, arrayDim1Length: locationRange.count, dim0Slow: 0..<1, dim1: locationRange)
-                        data3d[0..<data3d.nLocations, i, reader.hour /*/ domain.dtHours*/] = readTemp
-                    }
-                }
-                
-                // Deaverage radiation. Not really correct for 3h data after 81 hours, but interpolation will correct in the next step.
-                if variable.isAveragedOverForecastTime {
-                    data3d.deavergeOverTime()
-                }
-
-                
-                // De-accumulate precipitation
-                if variable.isAccumulatedSinceModelStart {
-                    data3d.deaccumulateOverTime()
-                }
-                
-                // Interpolate all missing values
-                // ICON-EPS ensemble model has 12-hourly values after 120 hours of forecast
-                // EPS ensemble models have 6-hourly data after 2 or 3 days of forecast
-                // Fill in missing hourly values after switching to 3h
-                data3d.interpolateInplace(type: variable.interpolation, skipFirst: skip, time: time, grid: domain.grid, locationRange: locationRange)
-                
-                progress.add(locationRange.count * nMembers)
-                return data3d.data[0..<locationRange.count * nTime * nMembers]
-            }
-            progress.finish()
-        }
-        logger.info("write init.txt")
-        try "\(run.timeIntervalSince1970)".write(toFile: domain.initFileNameOm, atomically: true, encoding: .utf8)
+        await curl.printStatistics()
+        return (handles, handles15minIconD2)
     }
 
     func run(using context: CommandContext, signature: Signature) async throws {
         let start = DispatchTime.now()
         let domain = try IconDomains.load(rawValue: signature.domain)
-        
+        let nConcurrent = signature.concurrent ?? 1
         let run = try signature.run.flatMap(Timestamp.fromRunHourOrYYYYMMDD) ?? domain.lastRun
         
         if signature.onlyVariables != nil && signature.group != nil {
@@ -377,14 +360,21 @@ struct DownloadIconCommand: AsyncCommandFix {
         logger.info("Downloading domain '\(domain.rawValue)' run '\(run.iso8601_YYYY_MM_dd_HH_mm)'")
         try await convertSurfaceElevation(application: context.application, domain: domain, run: run)
         
-        try await downloadIcon(application: context.application, domain: domain, run: run, skipFilesIfExisting: signature.skipExisting, variables: variables)
-        try convertIcon(logger: logger, domain: domain, run: run, variables: variables)
+        let (handles, handles15minIconD2) = try await downloadIcon(application: context.application, domain: domain, run: run, variables: variables)
+        try await GenericVariableHandle.convert(logger: logger, domain: domain, createNetcdf: signature.createNetcdf, run: run, nMembers: domain.ensembleMembers, handles: handles, concurrent: nConcurrent)
         if domain == .iconD2 {
-            // ICON-D2 download 15min data as well
-            try convertIcon(logger: logger, domain: .iconD2_15min, run: run, variables: variables)
+            // ICON-D2 downloads 15min data as well
+            try await GenericVariableHandle.convert(logger: logger, domain: IconDomains.iconD2_15min, createNetcdf: signature.createNetcdf, run: run, nMembers: IconDomains.iconD2_15min.ensembleMembers, handles: handles15minIconD2, concurrent: nConcurrent)
         }
         
         logger.info("Finished in \(start.timeElapsedPretty())")
+        
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: variables)
+            if domain == .iconD2 {
+                try DomainRegistry.dwd_icon_d2_15min.syncToS3(bucket: uploadS3Bucket, variables: variables)
+            }
+        }
     }
 }
 
@@ -424,35 +414,5 @@ extension IconDomains {
         default:
             return 1
         }
-    }
-}
-
-
-/// Workaround to use async in commans
-/// Wait for https://github.com/vapor/vapor/pull/2870
-protocol AsyncCommandFix: Command {
-    func run(using context: CommandContext, signature: Signature) async throws
-}
-
-extension AsyncCommandFix {
-    func run(using context: CommandContext, signature: Signature) throws {
-        // use same thread as downloader, do not use main loop
-        /*let eventloop = context.application.dedicatedHttpClient.eventLoopGroup.next()
-        let result = eventloop.flatSubmit {
-            let promise = eventloop.makePromise(of: Void.self)
-            promise.completeWithTask {
-                try await run(using: context, signature: signature)
-            }
-            return promise.futureResult
-        }
-        try result.wait()*/
-        
-        // mainloop or dedicated loop make no difference apparently
-        let eventloop = context.application.eventLoopGroup.next()
-        let promise = eventloop.makePromise(of: Void.self)
-        promise.completeWithTask {
-            try await run(using: context, signature: signature)
-        }
-        try promise.futureResult.wait()
     }
 }

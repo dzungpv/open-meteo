@@ -34,9 +34,11 @@ The API is available for non-commercial use at no cost. Despite being free of ch
 - The free non-commerical API is hosted at [https://api.open-meteo.com](https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&hourly=temperature_2m) using to GeoDNS to servers in Europe and North America (HTTPS is optional). The API source code is in this current repository.
 - The geocoding API source code is available in a separate repository https://github.com/open-meteo/geocoding-api
 - Larger changes are announced in the [Open-Meteo Blog](https://openmeteo.substack.com)
+- The [Open-Meteo weather database](https://github.com/open-meteo/open-data) is redistributed as part of an AWS Open-Data Sponsorship
 
 ## Who is using Open-Meteo?
 Apps:
+- [Weather.io](https://weather.roessner.tech) A simple Progressive Web App (PWA) for checking the weather.
 - [WeatherGraph](https://weathergraph.app) Apple Watch App
 - [Slideshow](https://slideshow.digital/) Digital Signage app for Android
 - [weewx-DWD](https://github.com/roe-dl/weewx-DWD) Weather forecasts etc. for WeeWX
@@ -50,6 +52,10 @@ Apps:
 - [Clima](https://f-droid.org/packages/co.prestosole.clima/) Beautiful, minimal, and fast weather app
 - [SkyMuse](https://github.com/cakephone/skymuse) Minimal, privacy-respecting weather app. Built with web technologies.
 - [Weather Please](https://github.com/ggaidelevicius/weather-please/) Clean and minimal new tab replacement for browsers
+- [QuickWeather](https://github.com/TylerWilliamson/QuickWeather) Fast, free, and open source Android app
+- [Rain](https://github.com/DarkMooNight/Rain) Free, open source, beautiful, minimal and fast weather app
+- [WetBulb](https://github.com/Isma1306/wetbulb-forecast) A simple app that shows you the wetbulb temp 24h forecast and tells you if it is dangerous.
+- [OSS Weather](https://github.com/Akylas/oss-weather) - Multi-model/multi-provider Open Source Android/iOS Weather app
 
 Repositories:
 - [Captain Cold](https://github.com/cburton-godaddy/captain-cold) Simple Open-Meteo -> Discord integration

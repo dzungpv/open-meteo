@@ -4,15 +4,11 @@ import SwiftPFor2D
 
 /// Read any time from multiple files
 struct OmFileSplitter {
+    let domain: DomainRegistry
     
-    /// like `/data/domain/` will be expanded to `/data/domain/variable_123235234.om`
-    let basePath: String
+    let masterTimeRange: Range<Timestamp>?
     
-    /// like `/data/domain-yearly/` and will be expanded to `/data/domain-yearly/2012_variable.om`
-    let yearlyArchivePath: String?
-    
-    /// Like `/data/domain-master/`
-    let omFileMaster: (path: String, time: TimerangeDt)?
+    let hasYearlyFiles: Bool
     
     /// actually also in file
     let nLocations: Int
@@ -42,22 +38,23 @@ struct OmFileSplitter {
         max(6, 3072 / nTimePerFile)
     }
     
-    init<Domain: GenericDomain>(_ domain: Domain) {
+    init<Domain: GenericDomain>(_ domain: Domain, nMembers: Int? = nil, chunknLocations: Int? = nil) {
         self.init(
-            basePath: domain.omfileDirectory,
-            nLocations: domain.grid.count,
+            domain: domain.domainRegistry,
+            nLocations: domain.grid.count * max(nMembers ?? 1, 1),
             nTimePerFile: domain.omFileLength,
-            yearlyArchivePath: domain.omfileArchive,
-            omFileMaster: domain.omFileMaster
+            hasYearlyFiles: domain.hasYearlyFiles,
+            masterTimeRange: domain.masterTimeRange,
+            chunknLocations: chunknLocations
         )
     }
     
-    init(basePath: String, nLocations: Int, nTimePerFile: Int, yearlyArchivePath: String?, omFileMaster: (path: String, time: TimerangeDt)? = nil, chunknLocations: Int? = nil) {
-        self.basePath = basePath
+    init(domain: DomainRegistry, nLocations: Int, nTimePerFile: Int, hasYearlyFiles: Bool, masterTimeRange: Range<Timestamp>?, chunknLocations: Int? = nil) {
+        self.domain = domain
         self.nLocations = nLocations
         self.nTimePerFile = nTimePerFile
-        self.yearlyArchivePath = yearlyArchivePath
-        self.omFileMaster = omFileMaster
+        self.hasYearlyFiles = hasYearlyFiles
+        self.masterTimeRange = masterTimeRange
         self.chunknLocations = chunknLocations ?? Self.calcChunknLocations(nTimePerFile: nTimePerFile)
     }
     
@@ -67,16 +64,16 @@ struct OmFileSplitter {
     }
 
     /// Prefetch all required data into memory
-    func willNeed(variable: String, location: Range<Int>, level: Int, time: TimerangeDt) throws {
+    func willNeed(variable: String, location: Range<Int>, level: Int, time: TimerangeDtAndSettings) throws {
         // TODO: maybe we can keep the file handles better in scope
-        let indexTime = time.toIndexTime()
+        let indexTime = time.time.toIndexTime()
         /// If yearly files are present, the start parameter is moved to read fewer files later
         var start = indexTime.lowerBound
         
-        if let omFileMaster {
-            let fileTime = omFileMaster.time.toIndexTime()
+        if let masterTimeRange {
+            let fileTime = TimerangeDt(range: masterTimeRange, dtSeconds: time.dtSeconds).toIndexTime()
             if let offsets = indexTime.intersect(fileTime: fileTime),
-               let omFile = try OmFileManager.get(OmFilePathWithTime(basePath: omFileMaster.path, variable: variable, timeChunk: 0)),
+               let omFile = try OmFileManager.get(.domainChunk(domain: domain, variable: variable, type: .master, chunk: 0, ensembleMember: time.ensembleMember, previousDay: time.previousDay)),
                 omFile.dim0 % nLocations == 0 {
                 let nLevels = omFile.dim0 / nLocations
                 if nLevels > 1 && location.count > 1 {
@@ -93,7 +90,7 @@ struct OmFileSplitter {
             return
         }
         
-        if let yearlyArchivePath {
+        if hasYearlyFiles {
             let startYear = time.range.lowerBound.toComponents().year
             /// end year is included in itteration range
             let endYear = time.range.upperBound.add(-1 * time.dtSeconds).toComponents().year
@@ -104,7 +101,7 @@ struct OmFileSplitter {
                 guard let offsets = indexTime.intersect(fileTime: fileTime) else {
                     continue
                 }
-                guard let omFile = try OmFileManager.get(OmFilePathWithTime(basePath: yearlyArchivePath, variable: variable, timeChunk: year)) else {
+                guard let omFile = try OmFileManager.get(.domainChunk(domain: domain, variable: variable, type: .year, chunk: year, ensembleMember: time.ensembleMember, previousDay: time.previousDay)) else {
                     continue
                 }
                 guard omFile.dim0 % nLocations == 0 else {
@@ -131,7 +128,7 @@ struct OmFileSplitter {
             guard let offsets = indexTime.intersect(fileTime: fileTime) else {
                 continue
             }
-            guard let omFile = try OmFileManager.get(OmFilePathWithTime(basePath: basePath, variable: variable, timeChunk: timeChunk)) else {
+            guard let omFile = try OmFileManager.get(.domainChunk(domain: domain, variable: variable, type: .chunk, chunk: timeChunk, ensembleMember: time.ensembleMember, previousDay: time.previousDay)) else {
                 continue
             }
             guard omFile.dim0 % nLocations == 0 else {
@@ -149,25 +146,25 @@ struct OmFileSplitter {
         }
     }
     
-    func read2D(variable: String, location: Range<Int>, level: Int, time: TimerangeDt) throws -> Array2DFastTime {
+    func read2D(variable: String, location: Range<Int>, level: Int, time: TimerangeDtAndSettings) throws -> Array2DFastTime {
         let data = try read(variable: variable, location: location, level: level, time: time)
-        return Array2DFastTime(data: data, nLocations: location.count, nTime: time.count)
+        return Array2DFastTime(data: data, nLocations: location.count, nTime: time.time.count)
     }
     
     /**
      TODO:
      - `level` implementation could be moved to a 3D file level
      */
-    func read(variable: String, location: Range<Int>, level: Int, time: TimerangeDt) throws -> [Float] {
-        let indexTime = time.toIndexTime()
+    func read(variable: String, location: Range<Int>, level: Int, time: TimerangeDtAndSettings) throws -> [Float] {
+        let indexTime = time.time.toIndexTime()
         var start = indexTime.lowerBound
         /// If yearly files are present, the start parameter is moved to read fewer files later
         var out = [Float](repeating: .nan, count: indexTime.count * location.count)
         
-        if let omFileMaster {
-            let fileTime = omFileMaster.time.toIndexTime()
+        if let masterTimeRange {
+            let fileTime = TimerangeDt(range: masterTimeRange, dtSeconds: time.dtSeconds).toIndexTime()
             if let offsets = indexTime.intersect(fileTime: fileTime),
-               let omFile = try OmFileManager.get(OmFilePathWithTime(basePath: omFileMaster.path, variable: variable, timeChunk: 0)),
+               let omFile = try OmFileManager.get(.domainChunk(domain: domain, variable: variable, type: .master, chunk: 0, ensembleMember: time.ensembleMember, previousDay: time.previousDay)),
                 omFile.dim0 % nLocations == 0 {
                 let nLevels = omFile.dim0 / nLocations
                 if nLevels > 1 && location.count > 1 {
@@ -175,13 +172,13 @@ struct OmFileSplitter {
                 }
                 if level < nLevels {
                     let dim0 = location.lowerBound * nLevels + level ..< location.lowerBound * nLevels + level + location.count
-                    try omFile.read(into: &out, arrayDim1Range: offsets.array, arrayDim1Length: time.count, dim0Slow: dim0, dim1: offsets.file)
+                    try omFile.read(into: &out, arrayDim1Range: offsets.array, arrayDim1Length: time.time.count, dim0Slow: dim0, dim1: offsets.file)
                     start = fileTime.upperBound
                 }
             }
         }
         
-        if let yearlyArchivePath {
+        if hasYearlyFiles {
             let startYear = time.range.lowerBound.toComponents().year
             /// end year is included in itteration range
             let endYear = time.range.upperBound.add(-1 * time.dtSeconds).toComponents().year
@@ -192,7 +189,7 @@ struct OmFileSplitter {
                 guard let offsets = indexTime.intersect(fileTime: fileTime) else {
                     continue
                 }
-                guard let omFile = try OmFileManager.get(OmFilePathWithTime(basePath: yearlyArchivePath, variable: variable, timeChunk: year)) else {
+                guard let omFile = try OmFileManager.get(.domainChunk(domain: domain, variable: variable, type: .year, chunk: year, ensembleMember: time.ensembleMember, previousDay: time.previousDay)) else {
                     continue
                 }
                 guard omFile.dim0 % nLocations == 0 else {
@@ -222,7 +219,7 @@ struct OmFileSplitter {
             guard let offsets = subring.intersect(fileTime: fileTime) else {
                 continue
             }
-            guard let omFile = try OmFileManager.get(OmFilePathWithTime(basePath: basePath, variable: variable, timeChunk: timeChunk)) else {
+            guard let omFile = try OmFileManager.get(.domainChunk(domain: domain, variable: variable, type: .chunk, chunk: timeChunk, ensembleMember: time.ensembleMember, previousDay: time.previousDay)) else {
                 continue
             }
             guard omFile.dim0 % nLocations == 0 else {
@@ -238,23 +235,21 @@ struct OmFileSplitter {
                 continue
             }
             let dim0 = location.lowerBound * nLevels + level ..< location.lowerBound * nLevels + level + location.count
-            try omFile.read(into: &out, arrayDim1Range: offsets.array.add(delta), arrayDim1Length: time.count, dim0Slow: dim0, dim1: offsets.file)
+            try omFile.read(into: &out, arrayDim1Range: offsets.array.add(delta), arrayDim1Length: time.time.count, dim0Slow: dim0, dim1: offsets.file)
         }
         return out
     }
     
     /**
      Write new data to the archived storage and combine it with existint data.
-     Updates are done in chunks of 8 MB to keep memory size low. Otherwise ICON update would take 4+ GB memory for just this function.
-     
-     TODO: smoothing is not implemented
+     Updates are done in chunks to keep memory size low. Otherwise ICON update would take 4+ GB memory for just this function.
      */
-    func updateFromTimeOriented(variable: String, array2d: Array2DFastTime, indexTime: Range<Int>, skipFirst: Int, smooth: Int, skipLast: Int, scalefactor: Float, compression: CompressionType = .p4nzdec256) throws {
+    func updateFromTimeOriented(variable: String, array2d: Array2DFastTime, time: TimerangeDt, skipFirst: Int, scalefactor: Float, compression: CompressionType = .p4nzdec256, storePreviousForecast: Bool) throws {
         
-        precondition(array2d.nTime == indexTime.count)
+        precondition(array2d.nTime == time.count)
         
         // Process at most 8 MB at once
-        try updateFromTimeOrientedStreaming(variable: variable, indexTime: indexTime, skipFirst: skipFirst, smooth: smooth, skipLast: skipLast, scalefactor: scalefactor, compression: compression) { d0offset in
+        try updateFromTimeOrientedStreaming(variable: variable, time: time, skipFirst: skipFirst, scalefactor: scalefactor, compression: compression, storePreviousForecast: storePreviousForecast) { d0offset in
             
             let locationRange = d0offset ..< min(d0offset+nLocationsPerChunk, nLocations)
             let dataRange = locationRange.multiply(array2d.nTime)
@@ -263,40 +258,49 @@ struct OmFileSplitter {
     }
     
     /**
-     Write new data to the archived storage and combine it with existint data.
+     Write new data to archived storage and combine it with existing data.
      `supplyChunk` should provide data for a couple of thousands locations at once. Upates are done streamlingly to low memory usage
-     
-     TODO: smoothing is not implemented
      */
-    func updateFromTimeOrientedStreaming(variable: String, indexTime: Range<Int>, skipFirst: Int, smooth: Int, skipLast: Int, scalefactor: Float, compression: CompressionType = .p4nzdec256, supplyChunk: (_ dim0Offset: Int) throws -> ArraySlice<Float>) throws {
+    func updateFromTimeOrientedStreaming(variable: String, time: TimerangeDt, skipFirst: Int, scalefactor: Float, compression: CompressionType = .p4nzdec256, storePreviousForecast: Bool, supplyChunk: (_ dim0Offset: Int) throws -> ArraySlice<Float>) throws {
+        
+        let indexTime = time.toIndexTime()
+        let indextimeChunked  = indexTime.lowerBound / nTimePerFile ..< indexTime.upperBound.divideRoundedUp(divisor: nTimePerFile)
+        
+        // Number of previous days of forecast to keep. Max 7 past days
+        let nPreviousDays = storePreviousForecast ? max(1, min(8, time.range.count / 86400)) : 1
+        
+        struct WriterPerStep {
+            let read: OmFileReader<MmapFile>?
+            let write: OmFileWriterState<FileHandle>
+            let offsets: (file: CountableRange<Int>, array: CountableRange<Int>)
+            let fileName: String
+            let skip: Int
+        }
         
         // open all files for all timeranges and write a header
-        let writers: [(read: OmFileReader<MmapFile>?, write: OmFileWriterState<FileHandle>, offsets: (file: CountableRange<Int>, array: CountableRange<Int>), fileName: String)] = try (indexTime.lowerBound / nTimePerFile ..< indexTime.upperBound.divideRoundedUp(divisor: nTimePerFile)).compactMap { timeChunk in
+        let writers: [WriterPerStep] = try indextimeChunked.flatMap { timeChunk -> [WriterPerStep] in
             let fileTime = timeChunk * nTimePerFile ..< (timeChunk+1) * nTimePerFile
-            
             guard let offsets = indexTime.intersect(fileTime: fileTime) else {
-                return nil
+                return []
             }
             
-            let readFile = basePath + variable + "_\(timeChunk).om"
-            let tempFile = readFile + "~"
-            let omRead = FileManager.default.fileExists(atPath: readFile) ? try OmFileReader(file: readFile) : nil
-            try omRead?.willNeed()
-            
-            try FileManager.default.removeItemIfExists(at: tempFile)
-            
-            let bufferSize = P4NENC256_BOUND(n: chunknLocations * nTimePerFile, bytesPerElement: compression.bytesPerElement)
-            let readBuffer = UnsafeMutableRawBufferPointer.allocate(byteCount: bufferSize, alignment: 4)
-            /// 1MB write cache
-            let writeBuffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(1024 * 1024, bufferSize))
-            //print("readBuffer \(readBuffer.count.bytesHumanReadable) writeBuffer \(writeBuffer.count.bytesHumanReadable)")
-            let fn = try FileHandle.createNewFile(file: tempFile)
-            
-            let omWrite = try OmFileWriterState<FileHandle>(fn: fn, dim0: nLocations, dim1: nTimePerFile, chunk0: chunknLocations, chunk1: nTimePerFile, compression: compression, scalefactor: scalefactor, readBuffer: readBuffer, writeBuffer: writeBuffer)
-            
-            try omWrite.writeHeader()
-            
-            return (omRead, omWrite, offsets, readFile)
+            return try (0..<nPreviousDays).map { previousDay -> WriterPerStep in
+                let skip = previousDay > 0 ? previousDay * 86400 / time.dtSeconds : skipFirst
+                let readFile = OmFileManagerReadable.domainChunk(domain: domain, variable: variable, type: .chunk, chunk: timeChunk, ensembleMember: 0, previousDay: previousDay)
+                try readFile.createDirectory()
+                let omRead = try readFile.openRead()
+                try omRead?.willNeed()
+
+                let tempFile = readFile.getFilePath() + "~"
+                try FileManager.default.removeItemIfExists(at: tempFile)
+                let fn = try FileHandle.createNewFile(file: tempFile)
+
+                let omWrite = try OmFileWriterState<FileHandle>(fn: fn, dim0: nLocations, dim1: nTimePerFile, chunk0: chunknLocations, chunk1: nTimePerFile, compression: compression, scalefactor: scalefactor)
+
+                try omWrite.writeHeader()
+                
+                return WriterPerStep(read: omRead, write: omWrite, offsets: offsets, fileName: readFile.getFilePath(), skip: skip)
+            }
         }
         
         let nIndexTime = indexTime.count
@@ -327,12 +331,12 @@ struct OmFileSplitter {
                 // write "new" data into existing data
                 for l in 0..<locationRange.count {
                     for (tFile,tArray) in zip(writer.offsets.file, writer.offsets.array) {
-                        if tArray < skipFirst {
+                        if tArray < writer.skip {
                             continue
                         }
-                        if nIndexTime - tArray <= skipLast {
+                        /*if nIndexTime - tArray <= skipLast {
                             continue
-                        }
+                        }*/
                         if data[data.startIndex + l * nIndexTime + tArray].isNaN {
                             continue
                         }
@@ -350,9 +354,6 @@ struct OmFileSplitter {
         /// Write end of file and move it in position
         for writer in writers {
             try writer.write.writeTail()
-            writer.write.readBuffer.deallocate()
-            writer.write.writeBuffer.deallocate()
-            
             try writer.write.fn.close()
             
             // Overwrite existing file, with newly created

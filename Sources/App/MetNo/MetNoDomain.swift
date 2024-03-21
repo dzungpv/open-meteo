@@ -4,16 +4,21 @@ import SwiftPFor2D
 enum MetNoDomain: String, GenericDomain, CaseIterable {
     case nordic_pp
     
-    var omfileDirectory: String {
-        return "\(OpenMeteo.dataDictionary)omfile-\(rawValue)/"
+    var domainRegistry: DomainRegistry {
+        switch self {
+        case .nordic_pp:
+            return .metno_nordic_pp
+        }
     }
-    var downloadDirectory: String {
-        return "\(OpenMeteo.dataDictionary)download-\(rawValue)/"
+    
+    var domainRegistryStatic: DomainRegistry? {
+        return domainRegistry
     }
-    var omfileArchive: String? {
-        return nil
+    
+    var hasYearlyFiles: Bool {
+        return false
     }
-    var omFileMaster: (path: String, time: TimerangeDt)? {
+    var masterTimeRange: Range<Timestamp>? {
         return nil
     }
     
@@ -23,20 +28,6 @@ enum MetNoDomain: String, GenericDomain, CaseIterable {
     var isGlobal: Bool {
         return false
     }
-
-    private static var nordicPpElevationFile = try? OmFileReader(file: Self.nordic_pp.surfaceElevationFileOm)
-    
-    func getStaticFile(type: ReaderStaticVariable) -> OmFileReader<MmapFile>? {
-        switch type {
-        case .soilType:
-            return nil
-        case .elevation:
-            switch self {
-            case .nordic_pp:
-                return Self.nordicPpElevationFile
-            }
-        }
-    }
     
     /// Based on the current time , guess the current run that should be available soon on the open-data server
     var lastRun: Timestamp {
@@ -45,10 +36,7 @@ enum MetNoDomain: String, GenericDomain, CaseIterable {
         return t.with(hour: t.hour)
     }
     
-    /// Filename of the surface elevation file
-    var surfaceElevationFileOm: String {
-        "\(omfileDirectory)HSURF.om"
-    }
+
     
     var omFileLength: Int {
         return 64 + 2*24
@@ -64,14 +52,26 @@ enum MetNoDomain: String, GenericDomain, CaseIterable {
 
 enum MetNoVariable: String, CaseIterable, GenericVariable, GenericVariableMixable {
     case temperature_2m
-    case cloudcover
+    case cloud_cover
     case pressure_msl
-    case relativehumidity_2m
-    case windspeed_10m
-    case winddirection_10m
-    case windgusts_10m
+    case relative_humidity_2m
+    case wind_speed_10m
+    case wind_direction_10m
+    case wind_gusts_10m
     case shortwave_radiation
     case precipitation
+    
+    var storePreviousForecast: Bool {
+        switch self {
+        case .temperature_2m, .relative_humidity_2m: return true
+        case .precipitation: return true
+        case .pressure_msl: return true
+        case .cloud_cover: return true
+        case .shortwave_radiation: return true
+        case .wind_gusts_10m, .wind_speed_10m, .wind_direction_10m: return true
+        //default: return false
+        }
+    }
     
     var requiresOffsetCorrectionForMixing: Bool {
         return false
@@ -85,21 +85,21 @@ enum MetNoVariable: String, CaseIterable, GenericVariable, GenericVariableMixabl
         switch self {
         case .temperature_2m:
             return 20
-        case .cloudcover:
+        case .cloud_cover:
             return 1
-        case .relativehumidity_2m:
+        case .relative_humidity_2m:
             return 1
         case .precipitation:
             return 10
-        case .windgusts_10m:
+        case .wind_gusts_10m:
             return 10
         case .pressure_msl:
             return 10
         case .shortwave_radiation:
             return 1
-        case .windspeed_10m:
+        case .wind_speed_10m:
             return 10
-        case .winddirection_10m:
+        case .wind_direction_10m:
             return 1
         }
     }
@@ -108,19 +108,19 @@ enum MetNoVariable: String, CaseIterable, GenericVariable, GenericVariableMixabl
         switch self {
         case .temperature_2m:
             return .hermite(bounds: nil)
-        case .cloudcover:
+        case .cloud_cover:
             return .hermite(bounds: 0...100)
         case .pressure_msl:
             return .hermite(bounds: nil)
-        case .relativehumidity_2m:
+        case .relative_humidity_2m:
             return .hermite(bounds: 0...100)
-        case .windspeed_10m:
+        case .wind_speed_10m:
             return .hermite(bounds: nil)
-        case .winddirection_10m:
+        case .wind_direction_10m:
             return .hermite(bounds: nil)
         case .precipitation:
             return .backwards_sum
-        case .windgusts_10m:
+        case .wind_gusts_10m:
             return .hermite(bounds: nil)
         case .shortwave_radiation:
             return .solar_backwards_averaged
@@ -131,21 +131,21 @@ enum MetNoVariable: String, CaseIterable, GenericVariable, GenericVariableMixabl
         switch self {
         case .temperature_2m:
             return .celsius
-        case .cloudcover:
-            return .percent
-        case .relativehumidity_2m:
-            return .percent
+        case .cloud_cover:
+            return .percentage
+        case .relative_humidity_2m:
+            return .percentage
         case .precipitation:
-            return .millimeter
-        case .windgusts_10m:
-            return .ms
+            return .millimetre
+        case .wind_gusts_10m:
+            return .metrePerSecond
         case .pressure_msl:
-            return .hectoPascal
+            return .hectopascal
         case .shortwave_radiation:
-            return .wattPerSquareMeter
-        case .windspeed_10m:
-            return .ms
-        case .winddirection_10m:
+            return .wattPerSquareMetre
+        case .wind_speed_10m:
+            return .metrePerSecond
+        case .wind_direction_10m:
             return .degreeDirection
         }
     }
@@ -154,9 +154,9 @@ enum MetNoVariable: String, CaseIterable, GenericVariable, GenericVariableMixabl
         switch self {
         case .temperature_2m:
             return (1, -273.15)
-        case .cloudcover:
+        case .cloud_cover:
             return (100, 0)
-        case .relativehumidity_2m:
+        case .relative_humidity_2m:
             return (100, 0)
         case .pressure_msl:
             return (1/100, 0)
@@ -190,17 +190,17 @@ enum MetNoVariable: String, CaseIterable, GenericVariable, GenericVariableMixabl
         switch self {
         case .temperature_2m:
             return "air_temperature_2m"
-        case .cloudcover:
+        case .cloud_cover:
             return "cloud_area_fraction"
         case .pressure_msl:
             return "air_pressure_at_sea_level"
-        case .relativehumidity_2m:
+        case .relative_humidity_2m:
             return "relative_humidity_2m"
-        case .windspeed_10m:
+        case .wind_speed_10m:
             return "wind_speed_10m"
-        case .winddirection_10m:
+        case .wind_direction_10m:
             return "wind_direction_10m"
-        case .windgusts_10m:
+        case .wind_gusts_10m:
             return "wind_speed_of_gust"
         case .shortwave_radiation:
             return "integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time"

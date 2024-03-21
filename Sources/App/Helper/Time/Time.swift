@@ -215,7 +215,23 @@ extension Timestamp: Strideable {
     }
 }
 
+extension Timestamp {
+    /// Parse range in format `yyymmdd-yymmdd`
+    static func parseRange(yyyymmdd str: String) throws -> ClosedRange<Timestamp> {
+        guard str.count == 17, str.contains("-") else {
+            throw TimeError.InvalidDateFromat
+        }
+        let start = Timestamp(Int(str[0..<4])!, Int(str[4..<6])!, Int(str[6..<8])!)
+        let end = Timestamp(Int(str[9..<13])!, Int(str[13..<15])!, Int(str[15..<17])!)
+        return start...end
+    }
+}
+
 extension Range where Bound == Timestamp {
+    @inlinable public var durationSeconds: Int {
+        upperBound.timeIntervalSince1970 - lowerBound.timeIntervalSince1970
+    }
+    
     @inlinable public func add(_ offset: Int) -> Range<Timestamp> {
         return lowerBound.add(offset) ..< upperBound.add(offset)
     }
@@ -268,6 +284,11 @@ public struct TimerangeDt: Hashable {
         self.dtSeconds = dtSeconds
     }
     
+    public init(range: ClosedRange<Timestamp>, dtSeconds: Int) {
+        self.range = range.lowerBound ..< range.upperBound.add(dtSeconds)
+        self.dtSeconds = dtSeconds
+    }
+    
     public init(start: Timestamp, nTime: Int, dtSeconds: Int) {
         self.range = start ..< start.add(nTime * dtSeconds)
         self.dtSeconds = dtSeconds
@@ -276,6 +297,11 @@ public struct TimerangeDt: Hashable {
     /// devide time by dtSeconds
     @inlinable public func toIndexTime() -> Range<Int> {
         return range.lowerBound.timeIntervalSince1970 / dtSeconds ..< range.upperBound.timeIntervalSince1970 / dtSeconds
+    }
+    
+    @inlinable public func index(of: Timestamp) -> Int? {
+        let index = (of.timeIntervalSince1970 - range.lowerBound.timeIntervalSince1970) / dtSeconds
+        return index < 0 || index >= count ? nil : index
     }
     
     @inlinable public func add(_ seconds: Int) -> TimerangeDt {

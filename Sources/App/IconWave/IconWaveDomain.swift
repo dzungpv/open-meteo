@@ -8,39 +8,25 @@ enum IconWaveDomain: String, CaseIterable, GenericDomain {
     case gwam
     case ewam
     
-    static var gwamElevation = try? OmFileReader(file: IconWaveDomain.gwam.surfaceElevationFileOm)
-    static var ewamElevation = try? OmFileReader(file: IconWaveDomain.ewam.surfaceElevationFileOm)
-    
-    var omfileDirectory: String {
-        return "\(OpenMeteo.dataDictionary)omfile-\(rawValue)/"
+    var hasYearlyFiles: Bool {
+        return false
     }
-    var omfileArchive: String? {
+    
+    var masterTimeRange: Range<Timestamp>? {
         return nil
     }
-    var omFileMaster: (path: String, time: TimerangeDt)? {
-        return nil
-    }
-    var downloadDirectory: String {
-        return "\(OpenMeteo.dataDictionary)download-\(rawValue)/"
-    }
     
-    /// Filename of the surface elevation file
-    var surfaceElevationFileOm: String {
-        "\(omfileDirectory)HSURF.om"
-    }
-    
-    func getStaticFile(type: ReaderStaticVariable) -> OmFileReader<MmapFile>? {
-        switch type {
-        case .soilType:
-            return nil
-        case .elevation:
-            switch self {
-            case .gwam:
-                return Self.gwamElevation
-            case .ewam:
-                return Self.ewamElevation
-            }
+    var domainRegistry: DomainRegistry {
+        switch self {
+        case .gwam:
+            return .dwd_gwam
+        case .ewam:
+            return .dwd_ewam
         }
+    }
+    
+    var domainRegistryStatic: DomainRegistry? {
+        return domainRegistry
     }
     
     /// Number of time steps in each time series optimised file. 5 days more than each run.
@@ -93,6 +79,10 @@ enum IconWaveVariable: String, CaseIterable, GenericVariable, GenericVariableMix
     case swell_wave_peak_period
     case swell_wave_direction
     
+    var storePreviousForecast: Bool {
+        return false
+    }
+    
     var isElevationCorrectable: Bool {
         return false
     }
@@ -141,29 +131,29 @@ enum IconWaveVariable: String, CaseIterable, GenericVariable, GenericVariableMix
     var unit: SiUnit {
         switch self {
         /*case .windspeed_10m:
-            return .ms
+            return .metrePerSecond
         case .winddirection_10m:
             return .degreeDirection*/
         case .wave_height:
-            return .meter
+            return .metre
         case .wave_period:
-            return .second
+            return .seconds
         case .wave_direction:
             return .degreeDirection
         case .wind_wave_height:
-            return .meter
+            return .metre
         case .wind_wave_period:
-            return .second
+            return .seconds
         case .wind_wave_peak_period:
-            return .second
+            return .seconds
         case .wind_wave_direction:
             return .degreeDirection
         case .swell_wave_height:
-            return .meter
+            return .metre
         case .swell_wave_period:
-            return .second
+            return .seconds
         case .swell_wave_peak_period:
-            return .second
+            return .seconds
         case .swell_wave_direction:
             return .degreeDirection
         }

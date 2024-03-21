@@ -4,7 +4,7 @@ import SwiftNetCDF
 import SwiftPFor2D
 
 /// Download CAMS Europe and Global air quality forecasts
-struct DownloadCamsCommand: AsyncCommandFix {
+struct DownloadCamsCommand: AsyncCommand {
     struct Signature: CommandSignature {
         @Argument(name: "domain")
         var domain: String
@@ -26,6 +26,9 @@ struct DownloadCamsCommand: AsyncCommandFix {
         
         @Option(name: "ftppassword", short: "p", help: "Password for the ECMWF CAMS FTP server")
         var ftppassword: String?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
 
     var help: String {
@@ -41,8 +44,6 @@ struct DownloadCamsCommand: AsyncCommandFix {
         
         let logger = context.application.logger
         logger.info("Downloading domain '\(domain.rawValue)' run '\(run.iso8601_YYYY_MM_dd_HH_mm)'")
-        
-        // todo dust multi level
         
         let variables = onlyVariables ?? CamsVariable.allCases
         switch domain {
@@ -62,6 +63,10 @@ struct DownloadCamsCommand: AsyncCommandFix {
             try downloadCamsEurope(logger: logger, domain: domain, run: run, skipFilesIfExisting: signature.skipExisting, variables: variables, cdskey: cdskey)
             try convertCamsEurope(logger: logger, domain: domain, run: run, variables: variables)
         }
+        
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: variables)
+        }
     }
     
     /// Download from the ECMWF CAMS ftp/http server
@@ -77,6 +82,9 @@ struct DownloadCamsCommand: AsyncCommandFix {
         let writer = OmFileWriter(dim0: nx, dim1: ny, chunk0: nx, chunk1: ny)
         
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient)
+        Process.alarm(seconds: 6 * 3600)
+        defer { Process.alarm(seconds: 0) }
+        
         let dateRun = run.format_YYYYMMddHH
         let remoteDir = "https://\(user):\(password)@aux.ecmwf.int/ecpds/data/file/CAMS_GLOBAL/\(dateRun)/"
         /// The surface level of multi-level files is available in the `CAMS_GLOBAL_ADDITIONAL` directory
@@ -126,13 +134,12 @@ struct DownloadCamsCommand: AsyncCommandFix {
                 try writer.write(file: filenameDest, compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: data)
             }
         }
-        curl.printStatistics()
+        await curl.printStatistics()
     }
     
     /// Assemble a time-series and update operational files
     func convertCamsGlobal(logger: Logger, domain: CamsDomain, run: Timestamp, variables: [CamsVariable]) throws {
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil)
+        let om = OmFileSplitter(domain)
         
         for variable in variables {
             guard let meta = variable.getCamsGlobalMeta()else {
@@ -158,10 +165,9 @@ struct DownloadCamsCommand: AsyncCommandFix {
             
             logger.info("Create om file")
             let startOm = DispatchTime.now()
-            let timeIndexStart = run.timeIntervalSince1970 / domain.dtSeconds
-            let timeIndices = timeIndexStart ..< timeIndexStart + data2d.nTime
+            let time = TimerangeDt(start: run, nTime: data2d.nTime, dtSeconds: domain.dtSeconds)
             //try data2d.transpose().writeNetcdf(filename: "\(domain.downloadDirectory)\(variable.rawValue).nc", nx: domain.grid.nx, ny: domain.grid.ny)
-            try om.updateFromTimeOriented(variable: variable.rawValue, array2d: data2d, indexTime: timeIndices, skipFirst: 0, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor)
+            try om.updateFromTimeOriented(variable: variable.rawValue, array2d: data2d, time: time, skipFirst: 0, scalefactor: variable.scalefactor, storePreviousForecast: variable.storePreviousForecast)
             logger.info("Update om finished in \(startOm.timeElapsedPretty())")
         }
         
@@ -216,8 +222,7 @@ struct DownloadCamsCommand: AsyncCommandFix {
     
     /// Process each variable and update time-series optimised files
     func convertCamsEurope(logger: Logger, domain: CamsDomain, run: Timestamp, variables: [CamsVariable]) throws {
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil)
+        let om = OmFileSplitter(domain)
         
         guard let ncFile = try NetCDF.open(path: "\(domain.downloadDirectory)download.nc", allowUpdate: false) else {
             fatalError("Could not open '\(domain.downloadDirectory)download.nc'")
@@ -243,9 +248,8 @@ struct DownloadCamsCommand: AsyncCommandFix {
             
             logger.info("Create om file")
             let startOm = DispatchTime.now()
-            let timeIndexStart = run.timeIntervalSince1970 / domain.dtSeconds
-            let timeIndices = timeIndexStart ..< timeIndexStart + data2d.nTime
-            try om.updateFromTimeOriented(variable: variable.rawValue, array2d: data2d, indexTime: timeIndices, skipFirst: 0, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor)
+            let time = TimerangeDt(start: run, nTime: data2d.nTime, dtSeconds: domain.dtSeconds)
+            try om.updateFromTimeOriented(variable: variable.rawValue, array2d: data2d, time: time, skipFirst: 0,  scalefactor: variable.scalefactor, storePreviousForecast: variable.storePreviousForecast)
             logger.info("Update om finished in \(startOm.timeElapsedPretty())")
         }
     }

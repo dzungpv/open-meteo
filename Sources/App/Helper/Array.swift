@@ -152,6 +152,9 @@ extension Array where Element == Float {
             return
         }
         for x in (1..<count).reversed() {
+            if self[x-1].isNaN {
+                continue
+            }
             self[x] = self[x-1] - self[x]
         }
     }
@@ -162,7 +165,17 @@ extension Array where Element == Float {
             return
         }
         for x in 1..<count {
+            if self[x-1].isNaN {
+                continue
+            }
             self[x] = self[x-1] - self[x]
+        }
+    }
+    
+    /// Ensure data is greater equals than
+    mutating func greater(than value: Float) {
+        for x in 0..<count {
+            self[x] = Swift.max(self[x], value)
         }
     }
 }

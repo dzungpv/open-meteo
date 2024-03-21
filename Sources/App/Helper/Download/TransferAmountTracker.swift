@@ -1,6 +1,5 @@
 import Vapor
 
-
 extension AsyncSequence where Element == ByteBuffer {
     /// Get tracker to print and track transfer rates
     func tracker(_ tracker: TransferAmountTracker) -> TransferAmountTrackerStream<Self> {
@@ -8,7 +7,7 @@ extension AsyncSequence where Element == ByteBuffer {
     }
 }
 
-final class TransferAmountTracker {
+final actor TransferAmountTracker {
     var transfered = 0
     var transferedLastPrint = 0
     let printDelta: Double = 20
@@ -25,8 +24,8 @@ final class TransferAmountTracker {
     }
     
     /// Print status from time to time
-    func add(_ bytes: Int) {
-        transfered += bytes
+    func set(_ bytes: Int) {
+        transfered = bytes
         let deltaT = Date().timeIntervalSince(lastPrint)
         if deltaT > printDelta {
             let timeElapsed = Date().timeIntervalSince(startTime).asSecondsPrettyPrint
@@ -44,8 +43,16 @@ final class TransferAmountTracker {
         }
     }
     
+    /// Print status from time to time
+    func add(_ bytes: Int) {
+        set(bytes + transfered)
+    }
+    
     /// Print end statistics
     func finish() {
+        guard transfered > 0 else {
+            return
+        }
         let timeElapsed = Date().timeIntervalSince(startTime)
         let rate = Int(Double(transfered) / timeElapsed)
         logger.info("Completed in \(timeElapsed.asSecondsPrettyPrint). Average speed \(rate.bytesHumanReadable)/s")
@@ -77,7 +84,7 @@ struct TransferAmountTrackerStream<T: AsyncSequence>: AsyncSequence where T.Elem
             guard let data = try await self.iterator.next() else {
                 return nil
             }
-            tracker.add(data.readableBytes)
+            await tracker.add(data.readableBytes)
             return data
         }
     }

@@ -2,70 +2,118 @@ import Foundation
 import Vapor
 
 
-struct IconWaveController {
-    func query(_ req: Request) throws -> EventLoopFuture<Response> {
-        try req.ensureSubdomain("marine-api")
-        let generationTimeStart = Date()
-        let params = try req.query.decode(IconWaveQuery.self)
-        try params.validate()
-        let currentTime = Timestamp.now()
-        
-        let allowedRange = Timestamp(2022, 7, 29) ..< currentTime.add(86400 * 11)
-        let timezone = try params.resolveTimezone()
-        let (utcOffsetSecondsActual, time) = try params.getTimerange(timezone: timezone, current: currentTime, forecastDays: 7, allowedRange: allowedRange)
-        /// For fractional timezones, shift data to show only for full timestamps
-        let utcOffsetShift = time.utcOffsetSeconds - utcOffsetSecondsActual
-        let hourlyTime = time.range.range(dtSeconds: 3600)
-        let dailyTime = time.range.range(dtSeconds: 3600*24)
-        
-        guard let reader = try IconWaveMixer(domains: IconWaveDomain.allCases, lat: params.latitude, lon: params.longitude, elevation: .nan, mode: params.cell_selection ?? .sea) else {
-            throw ForecastapiError.noDataAvilableForThisLocation
+enum IconWaveDomainApi: String, CaseIterable, RawRepresentableString, MultiDomainMixerDomain {
+    case best_match
+    case ewam
+    case gwam
+    case era5_ocean
+    
+    var countEnsembleMember: Int { return 1 }
+    
+    func getReader(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> [any GenericReaderProtocol] {
+        switch self {
+        case .best_match:
+            guard let reader: any GenericReaderProtocol = try IconWaveMixer(domains: [.gwam, .ewam], lat: lat, lon: lon, elevation: .nan, mode: mode, options: options) else {
+                throw ForecastapiError.noDataAvilableForThisLocation
+            }
+            return [reader]
+        case .ewam:
+            return try IconWaveReader(domain: .ewam, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+        case .gwam:
+            return try IconWaveReader(domain: .gwam, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+        case .era5_ocean:
+            return [try Era5Factory.makeReader(domain: .era5_ocean, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options)]
         }
-        // Start data prefetch to boooooooost API speed :D
-        let paramsHourly = try IconWaveVariable.load(commaSeparatedOptional: params.hourly)
-        let paramsDaily = try IconWaveVariableDaily.load(commaSeparatedOptional: params.daily)
+    }
+}
+
+struct IconWaveController {
+    func query(_ req: Request) async throws -> Response {
+        try await req.ensureSubdomain("marine-api")
+        let params = req.method == .POST ? try req.content.decode(ApiQueryParameter.self) : try req.query.decode(ApiQueryParameter.self)
+        try req.ensureApiKey("marine-api", apikey: params.apikey)
+        let currentTime = Timestamp.now()
+        let allowedRange = Timestamp(1940, 1, 1) ..< currentTime.add(86400 * 11)
         
-        // Run query on separat thread pool to not block the main pool
-        return ForecastapiController.runLoop.next().submit({
-            if let hourlyVariables = paramsHourly {
-                try reader.prefetchData(variables: hourlyVariables, time: hourlyTime)
-            }
-            if let dailyVariables = paramsDaily {
-                try reader.prefetchData(variables: dailyVariables, time: dailyTime)
-            }
+        let prepared = try params.prepareCoordinates(allowTimezones: true)
+        let domains = try IconWaveDomainApi.load(commaSeparatedOptional: params.models) ?? [.best_match]
+        let paramsHourly = try IconWaveVariable.load(commaSeparatedOptional: params.hourly)
+        let paramsCurrent = try IconWaveVariable.load(commaSeparatedOptional: params.current)
+        let paramsDaily = try IconWaveVariableDaily.load(commaSeparatedOptional: params.daily)
+        let nVariables = ((paramsHourly?.count ?? 0) + (paramsDaily?.count ?? 0)) * domains.count
+        
+        let locations: [ForecastapiResult<IconWaveDomainApi>.PerLocation] = try prepared.map { prepared in
+            let coordinates = prepared.coordinate
+            let timezone = prepared.timezone
+            let time = try params.getTimerange2(timezone: timezone, current: currentTime, forecastDaysDefault: 7, forecastDaysMax: 14, startEndDate: prepared.startEndDate, allowedRange: allowedRange, pastDaysMax: 92)
+            let timeLocal = TimerangeLocal(range: time.dailyRead.range, utcOffsetSeconds: timezone.utcOffsetSeconds)
+            let currentTimeRange = TimerangeDt(start: currentTime.floor(toNearest: 3600), nTime: 1, dtSeconds: 3600)
             
-            let hourly: ApiSection? = try paramsHourly.map { variables in
-                var res = [ApiColumn]()
-                res.reserveCapacity(variables.count)
-                for variable in variables {
-                    let d = try reader.get(variable: variable, time: hourlyTime).convertAndRound(params: params).toApi(name: variable.rawValue)
-                    res.append(d)
+            let readers: [ForecastapiResult<IconWaveDomainApi>.PerModel] = try domains.compactMap { domain in
+                guard let reader = try GenericReaderMulti<IconWaveVariable>(domain: domain, lat: coordinates.latitude, lon: coordinates.longitude, elevation: .nan, mode: params.cell_selection ?? .sea, options: params.readerOptions) else {
+                    return nil
                 }
-                return ApiSection(name: "hourly", time: hourlyTime.add(utcOffsetShift), columns: res)
+                
+                return .init(
+                    model: domain,
+                    latitude: reader.modelLat,
+                    longitude: reader.modelLon,
+                    elevation: reader.targetElevation,
+                    prefetch: {
+                        if let paramsHourly {
+                            try reader.prefetchData(variables: paramsHourly, time: time.hourlyRead.toSettings())
+                        }
+                        if let paramsCurrent {
+                            try reader.prefetchData(variables: paramsCurrent, time: currentTimeRange.toSettings())
+                        }
+                        if let paramsDaily {
+                            try reader.prefetchData(variables: paramsDaily, time: time.dailyRead.toSettings())
+                        }
+                    },
+                    current: paramsCurrent.map { variables in
+                        return {
+                            return .init(name: "current", time: currentTimeRange.range.lowerBound, dtSeconds: currentTimeRange.dtSeconds, columns: try variables.compactMap { variable in
+                                guard let d = try reader.get(variable: variable, time: currentTimeRange.toSettings())?.convertAndRound(params: params) else {
+                                    return nil
+                                }
+                                return .init(variable: .surface(variable), unit: d.unit, value: d.data.first ?? .nan)
+                            })
+                        }
+                    },
+                    hourly: paramsHourly.map { variables in
+                        return {
+                            return .init(name: "hourly", time: time.hourlyDisplay, columns: try variables.compactMap { variable in
+                                guard let d = try reader.get(variable: variable, time: time.hourlyRead.toSettings())?.convertAndRound(params: params) else {
+                                    return nil
+                                }
+                                assert(time.hourlyRead.count == d.data.count)
+                                return .init(variable: .surface(variable), unit: d.unit, variables: [.float(d.data)])
+                            })
+                        }
+                    },
+                    daily: paramsDaily.map { paramsDaily in
+                        return {
+                            return ApiSection(name: "daily", time: time.dailyDisplay, columns: try paramsDaily.compactMap { variable in
+                                guard let d = try reader.getDaily(variable: variable, params: params, time: time.dailyRead.toSettings()) else {
+                                    return nil
+                                }
+                                assert(time.dailyRead.count == d.data.count)
+                                return ApiColumn(variable: variable, unit: d.unit, variables: [.float(d.data)])
+                            })
+                        }
+                    },
+                    sixHourly: nil,
+                    minutely15: nil
+                )
             }
-            
-            let daily: ApiSection? = try paramsDaily.map { dailyVariables in
-                return ApiSection(name: "daily", time: dailyTime.add(utcOffsetShift), columns: try dailyVariables.map { variable in
-                    let d = try reader.getDaily(variable: variable, time: dailyTime).convertAndRound(params: params).toApi(name: variable.rawValue)
-                    assert(dailyTime.count == d.data.count)
-                    return d
-                })
+            guard !readers.isEmpty else {
+                throw ForecastapiError.noDataAvilableForThisLocation
             }
-            
-            let generationTimeMs = Date().timeIntervalSince(generationTimeStart) * 1000
-            let out = ForecastapiResult(
-                latitude: reader.modelLat,
-                longitude: reader.modelLon,
-                elevation: nil,
-                generationtime_ms: generationTimeMs,
-                utc_offset_seconds: utcOffsetSecondsActual,
-                timezone: timezone,
-                current_weather: nil,
-                sections: [hourly, daily].compactMap({$0}),
-                timeformat: params.timeformatOrDefault
-            )
-            return try out.response(format: params.format ?? .json)
-        })
+            return .init(timezone: timezone, time: timeLocal, locationId: coordinates.locationId, results: readers)
+        }
+        let result = ForecastapiResult<IconWaveDomainApi>(timeformat: params.timeformatOrDefault, results: locations)
+        await req.incrementRateLimiter(weight: result.calculateQueryWeight(nVariablesModels: nVariables))
+        return try await result.response(format: params.format ?? .json)
     }
 }
 
@@ -74,44 +122,7 @@ typealias IconWaveReader = GenericReader<IconWaveDomain, IconWaveVariable>
 struct IconWaveMixer: GenericReaderMixer {
     let reader: [IconWaveReader]
     
-    static func makeReader(domain: IconWaveDomain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws -> IconWaveReader? {
+    static func makeReader(domain: IconWaveDomain, lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> IconWaveReader? {
         return try IconWaveReader(domain: domain, lat: lat, lon: lon, elevation: elevation, mode: mode)
-    }
-}
-
-struct IconWaveQuery: Content, QueryWithStartEndDateTimeZone, ApiUnitsSelectable {
-    let latitude: Float
-    let longitude: Float
-    let hourly: [String]?
-    let daily: [String]?
-    let temperature_unit: TemperatureUnit?
-    let windspeed_unit: WindspeedUnit?
-    let precipitation_unit: PrecipitationUnit?
-    let length_unit: LengthUnit?
-    let timeformat: Timeformat?
-    let past_days: Int?
-    let format: ForecastResultFormat?
-    let timezone: String?
-    let cell_selection: GridSelectionMode?
-    
-    /// iso starting date `2022-02-01`
-    let start_date: IsoDate?
-    /// included end date `2022-06-01`
-    let end_date: IsoDate?
-    
-    func validate() throws {
-        if latitude > 90 || latitude < -90 || latitude.isNaN {
-            throw ForecastapiError.latitudeMustBeInRangeOfMinus90to90(given: latitude)
-        }
-        if longitude > 180 || longitude < -180 || longitude.isNaN {
-            throw ForecastapiError.longitudeMustBeInRangeOfMinus180to180(given: longitude)
-        }
-        if daily?.count ?? 0 > 0 && timezone == nil {
-            throw ForecastapiError.timezoneRequired
-        }
-    }
-    
-    var timeformatOrDefault: Timeformat {
-        return timeformat ?? .iso8601
     }
 }

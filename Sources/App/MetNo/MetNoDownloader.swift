@@ -7,22 +7,22 @@ import SwiftNetCDF
 /// Download MetNo domains from OpenDAP server
 /// https://github.com/metno/NWPdocs/wiki
 /// Nordic dataset (same as yr.no API) https://github.com/metno/NWPdocs/wiki/MET-Nordic-dataset
-struct MetNoDownloader: AsyncCommandFix {
+struct MetNoDownloader: AsyncCommand {
     struct Signature: CommandSignature {
         @Argument(name: "domain")
         var domain: String
 
         @Option(name: "run")
         var run: String?
-
-        @Flag(name: "skip-existing", help: "ONLY FOR TESTING! Do not use in production. May update the database with stale data")
-        var skipExisting: Bool
         
         @Flag(name: "create-netcdf")
         var createNetcdf: Bool
         
         @Option(name: "only-variables")
         var onlyVariables: String?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
 
     var help: String {
@@ -41,16 +41,20 @@ struct MetNoDownloader: AsyncCommandFix {
         logger.info("Downloading domain '\(domain.rawValue)' run '\(run.iso8601_YYYY_MM_dd_HH_mm)'")
         
         try FileManager.default.createDirectory(atPath: domain.downloadDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
         
-        //try await download(application: context.application, domain: domain, run: date, skipFilesIfExisting: signature.skipExisting)
         try convert(logger: logger, domain: domain, variables: variables, run: run, createNetcdf: signature.createNetcdf)
         logger.info("Finished in \(start.timeElapsedPretty())")
+        
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: variables)
+        }
     }
     
     /// Process each variable and update time-series optimised files
     func convert(logger: Logger, domain: MetNoDomain, variables: [MetNoVariable], run: Timestamp, createNetcdf: Bool) throws {
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil)
+        let om = OmFileSplitter(domain)
+        Process.alarm(seconds: 3 * 3600)
+        defer { Process.alarm(seconds: 0) }
         
         let openDap = "https://thredds.met.no/thredds/dodsC/metpplatest/met_forecast_1_0km_nordic_\(run.format_YYYYMMdd)T\(run.hour.zeroPadded(len: 2))Z.nc"
         
@@ -72,7 +76,8 @@ struct MetNoDownloader: AsyncCommandFix {
         }
         
         /// Create elevation file if requried
-        if !FileManager.default.fileExists(atPath: domain.surfaceElevationFileOm) {
+        let surfaceElevationFileOm = domain.surfaceElevationFileOm.getFilePath()
+        if !FileManager.default.fileExists(atPath: surfaceElevationFileOm) {
             logger.info("Creating elevation file")
             // unit meters
             guard var altitude = try ncFile.getVariable(name: "altitude")?.asType(Float.self)?.read() else {
@@ -88,7 +93,7 @@ struct MetNoDownloader: AsyncCommandFix {
                 }
             }
             logger.info("Writing elevation file")
-            try OmFileWriter(dim0: ny, dim1: nx, chunk0: 20, chunk1: 20).write(file: domain.surfaceElevationFileOm, compressionType: .p4nzdec256, scalefactor: 1, all: altitude)
+            try OmFileWriter(dim0: ny, dim1: nx, chunk0: 20, chunk1: 20).write(file: surfaceElevationFileOm, compressionType: .p4nzdec256, scalefactor: 1, all: altitude)
         }
         
         /// Verify projection and grid coordinates
@@ -135,7 +140,7 @@ struct MetNoDownloader: AsyncCommandFix {
             
             /// Create chunked time-series arrays instead of transposing the entire array
             let progress = ProgressTracker(logger: logger, total: nLocations, label: "Convert \(variable.rawValue)")
-            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, indexTime: time.toIndexTime(), skipFirst: skip, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor) { d0offset in
+            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, time: time, skipFirst: skip, scalefactor: variable.scalefactor, storePreviousForecast: variable.storePreviousForecast) { d0offset in
                 
                 let locationRange = d0offset ..< min(d0offset+nLocationsPerChunk, nLocations)
                 var data2d = Array2DFastTime(nLocations: locationRange.count, nTime: nTime)
@@ -165,6 +170,37 @@ struct MetNoDownloader: AsyncCommandFix {
     }
 }
 
+extension DomainRegistry {
+    /// Upload all data to a specified S3 bucket
+    func syncToS3(bucket: String, variables: [GenericVariable]?) throws {
+        let dir = rawValue
+        if let variables {
+            let vDirectories = variables.map { $0.omFileName.file } + ["static"]
+            for variable in vDirectories {
+                if variable.contains("_previous_day") {
+                    // do not upload data from past days yet
+                    continue
+                }
+                let src = "\(OpenMeteo.dataDirectory)\(dir)/\(variable)"
+                let dest = "s3://\(bucket)/data/\(dir)/\(variable)"
+                if !FileManager.default.fileExists(atPath: src) {
+                    continue
+                }
+                try Process.spawn(
+                    cmd: "aws",
+                    args: ["s3", "sync", "--exclude", "*~", "--no-progress", src, dest]
+                )
+            }
+        } else {
+            let src = "\(OpenMeteo.dataDirectory)\(dir)"
+            let dest = "s3://\(bucket)/data/\(dir)"
+            try Process.spawn(
+                cmd: "aws",
+                args: ["s3", "sync", "--exclude", "*~", "--no-progress", src, dest]
+            )
+        }
+    }
+}
 
 extension NetCDF {
     /// Try to open a file. If it does not excist, wait 10 seconds and try again until deadline is reached

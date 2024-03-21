@@ -12,15 +12,34 @@ enum GemDomain: String, GenericDomain, CaseIterable {
     case gem_global_ensemble
     
     var omfileDirectory: String {
-        return "\(OpenMeteo.dataDictionary)omfile-\(rawValue)/"
+        return "\(OpenMeteo.dataDirectory)omfile-\(rawValue)/"
     }
     var downloadDirectory: String {
-        return "\(OpenMeteo.dataDictionary)download-\(rawValue)/"
+        return "\(OpenMeteo.tempDirectory)download-\(rawValue)/"
     }
-    var omfileArchive: String? {
-        return nil
+    
+    var domainRegistry: DomainRegistry {
+        switch self {
+        case .gem_global:
+            return .cmc_gem_gdps
+        case .gem_regional:
+            return .cmc_gem_rdps
+        case .gem_hrdps_continental:
+            return .cmc_gem_hrdps
+        case .gem_global_ensemble:
+            return .cmc_gem_geps
+        }
     }
-    var omFileMaster: (path: String, time: TimerangeDt)? {
+    
+    var domainRegistryStatic: DomainRegistry? {
+        return domainRegistry
+    }
+    
+    var hasYearlyFiles: Bool {
+        return false
+    }
+    
+    var masterTimeRange: Range<Timestamp>? {
         return nil
     }
     
@@ -49,29 +68,6 @@ enum GemDomain: String, GenericDomain, CaseIterable {
         }
     }
 
-    private static var gemGlobalElevationFile = try? OmFileReader(file: Self.gem_global.surfaceElevationFileOm)
-    private static var gemRegionalElevationFile = try? OmFileReader(file: Self.gem_regional.surfaceElevationFileOm)
-    private static var gemHrdpsContinentalElevationFile = try? OmFileReader(file: Self.gem_hrdps_continental.surfaceElevationFileOm)
-    private static var gemGlobalEnsembleElevationFile = try? OmFileReader(file: Self.gem_global_ensemble.surfaceElevationFileOm)
-    
-    func getStaticFile(type: ReaderStaticVariable) -> OmFileReader<MmapFile>? {
-        switch type {
-        case .soilType:
-            return nil
-        case .elevation:
-            switch self {
-            case .gem_global:
-                return Self.gemGlobalElevationFile
-            case .gem_regional:
-                return Self.gemRegionalElevationFile
-            case .gem_hrdps_continental:
-                return Self.gemHrdpsContinentalElevationFile
-            case .gem_global_ensemble:
-                return Self.gemGlobalEnsembleElevationFile
-            }
-        }
-    }
-    
     /// Based on the current time , guess the current run that should be available soon on the open-data server
     var lastRun: Timestamp {
         let t = Timestamp.now()
@@ -91,11 +87,6 @@ enum GemDomain: String, GenericDomain, CaseIterable {
         case .gem_global_ensemble:
             return t.add(-3*3600).floor(toNearest: 12*3600)
         }
-    }
-    
-    /// Filename of the surface elevation file
-    var surfaceElevationFileOm: String {
-        "\(omfileDirectory)HSURF.om"
     }
     
     func getForecastHours(run: Timestamp) -> [Int] {

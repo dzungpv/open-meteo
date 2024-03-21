@@ -10,7 +10,7 @@ import Vapor
  
  model info (not everything is open data) https://www.ecmwf.int/en/forecasts/datasets/set-i
  */
-struct DownloadEcmwfCommand: AsyncCommandFix {
+struct DownloadEcmwfCommand: AsyncCommand {
     struct Signature: CommandSignature {
         @Option(name: "run")
         var run: String?
@@ -21,11 +21,17 @@ struct DownloadEcmwfCommand: AsyncCommandFix {
         @Option(name: "server", help: "Root server path. Default: 'https://data.ecmwf.int/forecasts/'")
         var server: String?
 
-        @Flag(name: "skip-existing", help: "ONLY FOR TESTING! Do not use in production. May update the database with stale data")
-        var skipExisting: Bool
+        @Option(name: "concurrent", short: "c", help: "Numer of concurrent download/conversion jobs")
+        var concurrent: Int?
+        
+        @Flag(name: "create-netcdf")
+        var createNetcdf: Bool
         
         @Option(name: "only-variables")
         var onlyVariables: String?
+        
+        @Option(name: "upload-s3-bucket", help: "Upload open-meteo database to an S3 bucket after processing")
+        var uploadS3Bucket: String?
     }
 
     var help: String {
@@ -50,26 +56,28 @@ struct DownloadEcmwfCommand: AsyncCommandFix {
         
         let onlyVariables = try EcmwfVariable.load(commaSeparatedOptional: signature.onlyVariables)
         let ensembleVariables = EcmwfVariable.allCases.filter({$0.includeInEnsemble != nil})
-        let defaultVariables = domain == .ifs04_ensemble ? ensembleVariables : EcmwfVariable.allCases
+        let defaultVariables = domain.isEnsemble ? ensembleVariables : EcmwfVariable.allCases
         let variables = onlyVariables ?? defaultVariables
-        
+        let nConcurrent = signature.concurrent ?? 1
         let base = signature.server ?? "https://data.ecmwf.int/forecasts/"
 
         try FileManager.default.createDirectory(atPath: domain.downloadDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
         try await downloadEcmwfElevation(application: context.application, domain: domain, base: base, run: run)
-        try await downloadEcmwf(application: context.application, domain: domain, base: base, run: run, skipFilesIfExisting: signature.skipExisting, variables: variables)
-        try convertEcmwf(logger: logger, domain: domain, run: run, variables: variables)
+        let handles = try await downloadEcmwf(application: context.application, domain: domain, base: base, run: run, variables: variables, concurrent: nConcurrent)
+        try await GenericVariableHandle.convert(logger: logger, domain: domain, createNetcdf: signature.createNetcdf, run: run, nMembers: domain.ensembleMembers, handles: handles, concurrent: nConcurrent)
+        
+        if let uploadS3Bucket = signature.uploadS3Bucket {
+            try domain.domainRegistry.syncToS3(bucket: uploadS3Bucket, variables: variables)
+        }
     }
     
     /// Download elevation file
     func downloadEcmwfElevation(application: Application, domain: EcmwfDomain, base: String, run: Timestamp) async throws {
         let logger = application.logger
         let surfaceElevationFileOm = domain.surfaceElevationFileOm
-        if FileManager.default.fileExists(atPath: surfaceElevationFileOm) {
+        if FileManager.default.fileExists(atPath: surfaceElevationFileOm.getFilePath()) {
             return
         }
-        try FileManager.default.createDirectory(atPath: domain.omfileDirectory, withIntermediateDirectories: true)
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient)
         
         var generateElevationFileData: (lsm: [Float]?, surfacePressure: [Float]?, sealevelPressure: [Float]?, temperature_2m: [Float]?) = (nil, nil, nil, nil)
@@ -77,7 +85,7 @@ struct DownloadEcmwfCommand: AsyncCommandFix {
         
         logger.info("Downloading height and elevation data")
         let url = domain.getUrl(base: base, run: run, hour: 0)
-        for message in try await curl.downloadEcmwfIndexed(url: url, isIncluded: { entry in
+        for try await message in try await curl.downloadEcmwfIndexed(url: url, concurrent: 1, isIncluded: { entry in
             guard entry.number == nil else {
                 // ignore ensemble members, only use control
                 return false
@@ -118,45 +126,110 @@ struct DownloadEcmwfCommand: AsyncCommandFix {
             return landmask < 0.5 ? -999 : Meteorology.elevation(sealevelPressure: sealevelPressure, surfacePressure: surfacePressure, temperature_2m: temperature_2m)
         }
         //try Array2DFastSpace(data: elevation, nLocations: domain.grid.count, nTime: 1).writeNetcdf(filename: "\(domain.downloadDirectory)/elevation.nc", nx: domain.grid.nx, ny: domain.grid.ny)
-        try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 20, chunk1: 20).write(file: domain.surfaceElevationFileOm, compressionType: .p4nzdec256, scalefactor: 1, all: elevation)
+        try domain.surfaceElevationFileOm.createDirectory()
+        if domain == .aifs025 {
+            try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 1, chunk1: 20*20).write(file: domain.surfaceElevationFileOm.getFilePath(), compressionType: .p4nzdec256, scalefactor: 1, all: elevation)
+        } else {
+            try OmFileWriter(dim0: domain.grid.ny, dim1: domain.grid.nx, chunk0: 20, chunk1: 20).write(file: domain.surfaceElevationFileOm.getFilePath(), compressionType: .p4nzdec256, scalefactor: 1, all: elevation)
+        }
+
     }
     
     /// Download ECMWF ifs open data
-    func downloadEcmwf(application: Application, domain: EcmwfDomain, base: String, run: Timestamp, skipFilesIfExisting: Bool, variables: [EcmwfVariable]) async throws {
+    func downloadEcmwf(application: Application, domain: EcmwfDomain, base: String, run: Timestamp, variables: [EcmwfVariable], concurrent: Int) async throws -> [GenericVariableHandle] {
         let logger = application.logger
         let curl = Curl(logger: logger, client: application.dedicatedHttpClient)
-        let downloadDirectory = domain.downloadDirectory
+        Process.alarm(seconds: 6 * 3600)
+        defer { Process.alarm(seconds: 0) }
+        
         let forecastSteps = domain.getDownloadForecastSteps(run: run.hour)
-        var grib2d = GribArray2D(nx: domain.grid.nx, ny: domain.grid.ny)
         let nMembers = domain.ensembleMembers
-        let nLocationsPerChunk = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: domain.grid.count, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil, chunknLocations: nMembers > 1 ? nMembers : nil).nLocationsPerChunk
+        let nLocationsPerChunk = OmFileSplitter(domain, nMembers: nMembers, chunknLocations: nMembers > 1 ? nMembers : nil).nLocationsPerChunk
         let writer = OmFileWriter(dim0: 1, dim1: domain.grid.count, chunk0: 1, chunk1: nLocationsPerChunk)
+        
+        var handles = [GenericVariableHandle]()
+        let deaverager = GribDeaverager()
         
         for hour in forecastSteps {
             logger.info("Downloading hour \(hour)")
+            let timestamp = run.add(hours: hour)
             
-            let variables = variables.filter { variable in
-                let file = "\(downloadDirectory)\(variable.omFileName.file)_\(hour).om"
-                return !skipFilesIfExisting || FileManager.default.fileExists(atPath: file)
-            }
             if variables.isEmpty {
                 continue
             }
-            var inMemory = [VariableAndMemberAndControl<EcmwfVariable>: [Float]]()
+            struct EcmwfVariableMember: Hashable {
+                let variable: EcmwfVariable
+                let member: Int
+                
+                init(_ variable: EcmwfVariable, _ member: Int) {
+                    self.variable = variable
+                    self.member = member
+                }
+            }
+            let inMemory = DictionaryActor<EcmwfVariableMember, [Float]>()
+            
+            /// Relative humidity missing in AIFS
+            func calcRh(rh: EcmwfVariable, q:  EcmwfVariable, t: EcmwfVariable, member: Int, hpa: Float) async throws {
+                guard await inMemory.get(.init(rh, member)) == nil, let q = await inMemory.get(.init(q, member)), let t = await inMemory.get(.init(t, member)) else {
+                    return
+                }
+                let data = Meteorology.specificToRelativeHumidity(specificHumidity: q, temperature: t, pressure: .init(repeating: hpa, count: t.count))
+                await inMemory.set(.init(rh, member), data)
+                let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: 1, all: data)
+                handles.append(GenericVariableHandle(
+                    variable: rh,
+                    time: timestamp,
+                    member: member,
+                    fn: fn,
+                    skipHour0: false
+                ))
+            }
+            
+            /// AIFS missed U/V wind components
+            func calcWindComponents(u: EcmwfVariable, v: EcmwfVariable, gph: EcmwfVariable, member: Int, hpa: Float) async throws {
+                guard await inMemory.get(.init(u, member)) == nil, let gph = await inMemory.get(.init(gph, member)) else {
+                    return
+                }
+                guard let grid = domain.grid as? RegularGrid else {
+                    fatalError("required regular grid")
+                }
+                let (uData, vData) = Meteorology.geostrophicWind(geopotentialHeightMeters: gph, grid: grid)
+                handles.append(GenericVariableHandle(
+                    variable: u,
+                    time: timestamp,
+                    member: member,
+                    fn: try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: u.scalefactor, all: uData),
+                    skipHour0: false
+                ))
+                handles.append(GenericVariableHandle(
+                    variable: v,
+                    time: timestamp,
+                    member: member,
+                    fn: try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: u.scalefactor, all: vData),
+                    skipHour0: false
+                ))
+            }
             
             let url = domain.getUrl(base: base, run: run, hour: hour)
-            for message in try await curl.downloadEcmwfIndexed(url: url, isIncluded: { entry in
+            let h = try await curl.downloadEcmwfIndexed(url: url, concurrent: concurrent, isIncluded: { entry in
                 return variables.contains(where: { variable in
                     if let level = entry.level {
                         // entry is a pressure level variable
+                        if variable.gribName == "gh" && variable.level == level && entry.param == "z" {
+                            return true
+                        }
                         return variable.level == level && entry.param == variable.gribName
                     }
                     return entry.param == variable.gribName
                 })
-            }) {
-                let shortName = message.get(attribute: "shortName")!
+            }).mapStream(nConcurrent: concurrent) { message -> GenericVariableHandle? in
+                guard let shortName = message.get(attribute: "shortName"),
+                      var stepRange = message.get(attribute: "stepRange"),
+                      let stepType = message.get(attribute: "stepType") else {
+                    fatalError("could not get step range or type")
+                }
                 if shortName == "lsm" {
-                    continue
+                    return nil
                 }
                 let levelhPa = message.get(attribute: "level").flatMap(Int.init)!
                 let member = message.get(attribute: "perturbationNumber").flatMap(Int.init) ?? 0
@@ -165,7 +238,13 @@ struct DownloadEcmwfCommand: AsyncCommandFix {
                     if variable == .total_column_integrated_water_vapour && shortName == "tcwv" {
                         return true
                     }
-                    return shortName == variable.gribName && levelhPa == (variable.level ?? 0)
+                    if let level = variable.level {
+                        if shortName == "z" && variable.gribName == "gh" && levelhPa == level {
+                            return true
+                        }
+                        return shortName == variable.gribName && levelhPa == level
+                    }
+                    return shortName == variable.gribName
                 }) else {
                     print(
                         message.get(attribute: "name")!,
@@ -182,44 +261,129 @@ struct DownloadEcmwfCommand: AsyncCommandFix {
                     fatalError("Got unknown variable \(shortName) \(levelhPa)")
                 }
                 //logger.info("Processing \(variable)")
-                
+                var grib2d = GribArray2D(nx: domain.grid.nx, ny: domain.grid.ny)
                 try grib2d.load(message: message)
                 grib2d.array.flipLatitude()
+                
+                //try message.debugGrid(grid: domain.grid, flipLatidude: false, shift180Longitude: false)
+                //fatalError()
                 
                 // Scaling before compression with scalefactor
                 if let fma = variable.multiplyAdd {
                     grib2d.array.data.multiplyAdd(multiply: fma.multiply, add: fma.add)
                 }
                 
+                if shortName == "z" && domain == .aifs025 {
+                    grib2d.array.data.multiplyAdd(multiply: 1/9.80665, add: 0)
+                }
+                
+                // solar shortwave radition show accum with step range "90"
+                if stepType == "accum" && !stepRange.contains("-") {
+                    stepRange = "0-\(stepRange)"
+                }
+                
+                // Deaccumulate precipitation
+                guard await deaverager.deaccumulateIfRequired(variable: variable, member: member, stepType: stepType, stepRange: stepRange, grib2d: &grib2d) else {
+                    return nil
+                }
+                
                 // Keep relative humidity in memory to generate total cloud cover files
                 if variable.gribName == "r" {
-                    inMemory[.init(variable, member)] = grib2d.array.data
+                    await inMemory.set(.init(variable, member), grib2d.array.data)
                 }
                 
-                if domain == .ifs04_ensemble && variable.includeInEnsemble != .downloadAndProcess {
+                // For AIFS keep specific humidity and temperature in memory
+                // geopotential and vertical velocity for wind calculation
+                if domain == .aifs025 && ["t", "q", "w", "z", "gh"].contains(variable.gribName) {
+                    await inMemory.set(.init(variable, member), grib2d.array.data)
+                }
+                if variable == .temperature_2m {
+                    await inMemory.set(.init(variable, member), grib2d.array.data)
+                }
+                
+                if variable == .dew_point_2m {
+                    await inMemory.set(.init(variable, member), grib2d.array.data)
+                    return nil
+                }
+                
+                if domain.isEnsemble && variable.includeInEnsemble != .downloadAndProcess {
                     // do not generate some database files for ensemble
-                    continue
+                    return nil
                 }
                 
-                let memberStr = member > 0 ? "_\(member)" : ""
-                let file = "\(downloadDirectory)\(variable.omFileName.file)_\(hour)\(memberStr).om"
-                
-                let compression = variable.isAccumulatedSinceModelStart ? CompressionType.fpxdec32 : .p4nzdec256
-                try writer.write(file: file, compressionType: compression, scalefactor: variable.scalefactor, all: grib2d.array.data, overwrite: true)
-            }
+                let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: variable.scalefactor, all: grib2d.array.data)
+                return GenericVariableHandle(
+                    variable: variable,
+                    time: timestamp,
+                    member: member,
+                    fn: fn,
+                    skipHour0: false
+                )
+            }.collect().compactMap({$0})
+            handles.append(contentsOf: h)
             
             // Calculate mid/low/high/total cloudocover
             logger.info("Calculating cloud cover")
             for member in 0..<domain.ensembleMembers {
-                guard let rh1000 = inMemory[.init(.relative_humidity_1000hPa, member)],
-                      let rh925 = inMemory[.init(.relative_humidity_925hPa, member)],
-                      let rh850 = inMemory[.init(.relative_humidity_850hPa, member)],
-                      let rh700 = inMemory[.init(.relative_humidity_700hPa, member)],
-                      let rh500 = inMemory[.init(.relative_humidity_500hPa, member)],
-                      let rh300 = inMemory[.init(.relative_humidity_300hPa, member)],
-                      let rh250 = inMemory[.init(.relative_humidity_250hPa, member)],
-                      let rh200 = inMemory[.init(.relative_humidity_200hPa, member)],
-                      let rh50 = inMemory[.init(.relative_humidity_50hPa, member)] else {
+                /// calculate RH 2m from dewpoint. Only store RH on disk.
+                if let dewpoint = await inMemory.get(.init(.dew_point_2m, member)), let temperature = await inMemory.get(.init(.temperature_2m, member)) {
+                    let rh = zip(temperature, dewpoint).map(Meteorology.relativeHumidity)
+                    let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: 1, all: rh)
+                    handles.append(GenericVariableHandle(
+                        variable: EcmwfVariable.relative_humidity_2m,
+                        time: timestamp,
+                        member: member,
+                        fn: fn,
+                        skipHour0: false
+                    ))
+                } else if let rh1000 = await inMemory.get(.init(.relative_humidity_1000hPa, member)) {
+                    let fn = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: 1, all: rh1000)
+                    handles.append(GenericVariableHandle(
+                        variable: EcmwfVariable.relative_humidity_2m,
+                        time: timestamp,
+                        member: member,
+                        fn: fn,
+                        skipHour0: false
+                    ))
+                }
+                
+                /// U/V wind components
+                try await calcWindComponents(u: .wind_u_component_1000hPa, v: .wind_v_component_1000hPa, gph: .geopotential_height_1000hPa, member: member, hpa: 1000)
+                try await calcWindComponents(u: .wind_u_component_925hPa, v: .wind_v_component_925hPa, gph: .geopotential_height_925hPa, member: member, hpa: 925)
+                try await calcWindComponents(u: .wind_u_component_850hPa, v: .wind_v_component_850hPa, gph: .geopotential_height_850hPa, member: member, hpa: 850)
+                try await calcWindComponents(u: .wind_u_component_700hPa, v: .wind_v_component_700hPa, gph: .geopotential_height_700hPa, member: member, hpa: 700)
+                try await calcWindComponents(u: .wind_u_component_600hPa, v: .wind_v_component_600hPa, gph: .geopotential_height_600hPa, member: member, hpa: 600)
+                try await calcWindComponents(u: .wind_u_component_500hPa, v: .wind_v_component_500hPa, gph: .geopotential_height_500hPa, member: member, hpa: 500)
+                try await calcWindComponents(u: .wind_u_component_400hPa, v: .wind_v_component_400hPa, gph: .geopotential_height_400hPa, member: member, hpa: 400)
+                try await calcWindComponents(u: .wind_u_component_300hPa, v: .wind_v_component_300hPa, gph: .geopotential_height_300hPa, member: member, hpa: 300)
+                try await calcWindComponents(u: .wind_u_component_250hPa, v: .wind_v_component_250hPa, gph: .geopotential_height_250hPa, member: member, hpa: 250)
+                try await calcWindComponents(u: .wind_u_component_200hPa, v: .wind_v_component_200hPa, gph: .geopotential_height_200hPa, member: member, hpa: 200)
+                try await calcWindComponents(u: .wind_u_component_100hPa, v: .wind_v_component_100hPa, gph: .geopotential_height_100hPa, member: member, hpa: 100)
+                try await calcWindComponents(u: .wind_u_component_50hPa, v: .wind_v_component_50hPa, gph: .geopotential_height_50hPa, member: member, hpa: 50)
+                
+                /// Relative humidity missing in AIFS
+                try await calcRh(rh: .relative_humidity_1000hPa, q: .specific_humidity_1000hPa, t: .temperature_1000hPa, member: member, hpa: 1000)
+                try await calcRh(rh: .relative_humidity_925hPa, q: .specific_humidity_925hPa, t: .temperature_925hPa, member: member, hpa: 925)
+                try await calcRh(rh: .relative_humidity_850hPa, q: .specific_humidity_850hPa, t: .temperature_850hPa, member: member, hpa: 850)
+                try await calcRh(rh: .relative_humidity_700hPa, q: .specific_humidity_700hPa, t: .temperature_700hPa, member: member, hpa: 700)
+                try await calcRh(rh: .relative_humidity_600hPa, q: .specific_humidity_600hPa, t: .temperature_600hPa, member: member, hpa: 600)
+                try await calcRh(rh: .relative_humidity_500hPa, q: .specific_humidity_500hPa, t: .temperature_500hPa, member: member, hpa: 500)
+                try await calcRh(rh: .relative_humidity_400hPa, q: .specific_humidity_400hPa, t: .temperature_400hPa, member: member, hpa: 400)
+                try await calcRh(rh: .relative_humidity_300hPa, q: .specific_humidity_300hPa, t: .temperature_300hPa, member: member, hpa: 300)
+                try await calcRh(rh: .relative_humidity_250hPa, q: .specific_humidity_250hPa, t: .temperature_250hPa, member: member, hpa: 250)
+                try await calcRh(rh: .relative_humidity_200hPa, q: .specific_humidity_200hPa, t: .temperature_200hPa, member: member, hpa: 200)
+                try await calcRh(rh: .relative_humidity_100hPa, q: .specific_humidity_100hPa, t: .temperature_100hPa, member: member, hpa: 100)
+                try await calcRh(rh: .relative_humidity_50hPa, q: .specific_humidity_50hPa, t: .temperature_50hPa, member: member, hpa: 50)
+                
+                guard let rh1000 = await inMemory.get(.init(.relative_humidity_1000hPa, member)),
+                      let rh925 = await inMemory.get(.init(.relative_humidity_925hPa, member)),
+                      let rh850 = await inMemory.get(.init(.relative_humidity_850hPa, member)),
+                      let rh700 = await inMemory.get(.init(.relative_humidity_700hPa, member)),
+                      let rh500 = await inMemory.get(.init(.relative_humidity_500hPa, member)),
+                      let rh300 = await inMemory.get(.init(.relative_humidity_300hPa, member)),
+                      let rh250 = await inMemory.get(.init(.relative_humidity_250hPa, member)),
+                      let rh200 = await inMemory.get(.init(.relative_humidity_200hPa, member)),
+                      let rh50 = await inMemory.get(.init(.relative_humidity_50hPa, member)) else {
                     logger.warning("Pressure level relative humidity unavailable")
                     continue
                 }
@@ -238,90 +402,44 @@ struct DownloadEcmwfCommand: AsyncCommandFix {
                                max(Meteorology.relativeHumidityToCloudCover(relativeHumidity: $0.1.0, pressureHPa: 200),
                                    Meteorology.relativeHumidityToCloudCover(relativeHumidity: $0.1.1, pressureHPa: 50)))
                 }
-                let memberStr = member > 0 ? "_\(member)" : ""
-                try writer.write(file: "\(downloadDirectory)cloudcover_low_\(hour)\(memberStr).om", compressionType: .p4nzdec256, scalefactor: 1, all: cloudcoverLow, overwrite: true)
-                try writer.write(file: "\(downloadDirectory)cloudcover_mid_\(hour)\(memberStr).om", compressionType: .p4nzdec256, scalefactor: 1, all: cloudcoverMid, overwrite: true)
-                try writer.write(file: "\(downloadDirectory)cloudcover_high_\(hour)\(memberStr).om", compressionType: .p4nzdec256, scalefactor: 1, all: cloudcoverHigh, overwrite: true)
+                let fnCloudCoverLow = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: 1, all: cloudcoverLow)
+                let fnCloudCoverMid = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: 1, all: cloudcoverMid)
+                let fnCloudCoverHigh = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: 1, all: cloudcoverHigh)
                 let cloudcover = Meteorology.cloudCoverTotal(low: cloudcoverLow, mid: cloudcoverMid, high: cloudcoverHigh)
-                try writer.write(file: "\(downloadDirectory)cloudcover_\(hour)\(memberStr).om", compressionType: .p4nzdec256, scalefactor: 1, all: cloudcover, overwrite: true)
+                let fnCloudCover = try writer.writeTemporary(compressionType: .p4nzdec256, scalefactor: 1, all: cloudcover)
+                
+                handles.append(GenericVariableHandle(
+                    variable: EcmwfVariable.cloud_cover_low,
+                    time: timestamp,
+                    member: member,
+                    fn: fnCloudCoverLow,
+                    skipHour0: false
+                ))
+                handles.append(GenericVariableHandle(
+                    variable: EcmwfVariable.cloud_cover_mid,
+                    time: timestamp,
+                    member: member,
+                    fn: fnCloudCoverMid,
+                    skipHour0: false
+                ))
+                handles.append(GenericVariableHandle(
+                    variable: EcmwfVariable.cloud_cover_high,
+                    time: timestamp,
+                    member: member,
+                    fn: fnCloudCoverHigh,
+                    skipHour0: false
+                ))
+                handles.append(GenericVariableHandle(
+                    variable: EcmwfVariable.cloud_cover,
+                    time: timestamp,
+                    member: member,
+                    fn: fnCloudCover,
+                    skipHour0: false
+                ))
             }
         }
-        curl.printStatistics()
-    }
-    
-    func convertEcmwf(logger: Logger, domain: EcmwfDomain, run: Timestamp, variables: [EcmwfVariable]) throws {
-        let downloadDirectory = domain.downloadDirectory
-        let nMembers = domain.ensembleMembers
-        
-        let forecastSteps = domain.getDownloadForecastSteps(run: run.hour)
-        let nTime = forecastSteps.max()! / domain.dtHours + 1
-        
-        let time = TimerangeDt(start: run, nTime: nTime, dtSeconds: domain.dtSeconds)
-        
-        let nLocations = domain.grid.nx * domain.grid.ny
-        
-        let om = OmFileSplitter(basePath: domain.omfileDirectory, nLocations: nLocations * nMembers, nTimePerFile: domain.omFileLength, yearlyArchivePath: nil, chunknLocations: nMembers > 1 ? nMembers : nil)
-        let nLocationsPerChunk = om.nLocationsPerChunk
-        
-        var data3d = Array3DFastTime(nLocations: nLocationsPerChunk, nLevel: nMembers, nTime: nTime)
-        var readTemp = [Float](repeating: .nan, count: nLocationsPerChunk)
-        
-        for variable in variables {
-            if domain == .ifs04_ensemble && variable.includeInEnsemble != .downloadAndProcess {
-                // do not generate some database files for ensemble
-                continue
-            }
-            
-            let progress = ProgressTracker(logger: logger, total: nLocations * nMembers, label: "Convert \(variable.rawValue)")
-            let skip = 0
-        
-            let readers: [(hour: Int, reader: [OmFileReader<MmapFile>])] = try forecastSteps.compactMap({ hour in
-                let readers = try (0..<nMembers).map { member in
-                    let memberStr = member > 0 ? "_\(member)" : ""
-                    return try OmFileReader(file: "\(downloadDirectory)\(variable.omFileName.file)_\(hour)\(memberStr).om")
-                }
-                return (hour, readers)
-            })
-            
-            try om.updateFromTimeOrientedStreaming(variable: variable.omFileName.file, indexTime: time.toIndexTime(), skipFirst: skip, smooth: 0, skipLast: 0, scalefactor: variable.scalefactor) { offset in
-                let d0offset = offset / nMembers
-                
-                let locationRange = d0offset ..< min(d0offset+nLocationsPerChunk, nLocations)
-                data3d.data.fillWithNaNs()
-                for reader in readers {
-                    for (i, memberReader) in reader.reader.enumerated() {
-                        try memberReader.read(into: &readTemp, arrayRange: 0..<locationRange.count, arrayDim1Length: locationRange.count, dim0Slow: 0..<1, dim1: locationRange)
-                        data3d[0..<data3d.nLocations, i, reader.hour / domain.dtHours] = readTemp
-                    }
-                }
-                
-                // De-accumulate precipitation
-                if variable.isAccumulatedSinceModelStart {
-                    data3d.deaccumulateOverTime()
-                }
-                
-                // Interpolate all missing values
-                data3d.interpolateInplace(
-                    type: variable.interpolation,
-                    skipFirst: skip,
-                    time: time,
-                    grid: domain.grid,
-                    locationRange: locationRange
-                )
-                
-                progress.add(locationRange.count * nMembers)
-                return data3d.data[0..<locationRange.count * nTime * nMembers]
-            }
-            progress.finish()
-        }
-        
-        var indexTimeEnd = run.timeIntervalSince1970 + 241 * 3600
-        if run.hour == 6 || run.hour == 18 {
-            // run 6 and 18 only have 90 instead 240
-            indexTimeEnd += (240 - 90) * 3600
-        }
-        let indexTimeStart = indexTimeEnd - domain.omFileLength * domain.dtSeconds + 12 * 3600
-        try "\(run.timeIntervalSince1970),\(domain.omFileLength),\(indexTimeStart),\(indexTimeEnd)".write(toFile: "\(domain.omfileDirectory)init.txt", atomically: true, encoding: .utf8)
+        await curl.printStatistics()
+        return handles
     }
 }
 
@@ -332,11 +450,14 @@ extension EcmwfDomain {
         let twoHoursAgo = Timestamp.now().add(-7200)
         let t = Timestamp.now()
         switch self {
-        case .ifs04_ensemble:
+        case .ifs04_ensemble, .ifs025_ensemble:
             fallthrough
-        case .ifs04:
+        case .ifs04,. ifs025:
             // ECMWF has a delay of 7-8 hours after initialisation
             return twoHoursAgo.with(hour: ((t.hour - 7 + 24) % 24) / 6 * 6)
+        case .aifs025:
+            // AIFS025 has a delay of 6-7 hours after initialisation
+            return twoHoursAgo.with(hour: ((t.hour - 6 + 24) % 24) / 6 * 6)
         }
     }
     /// Get download url for a given domain and timestep
@@ -346,9 +467,17 @@ extension EcmwfDomain {
         switch self {
         case .ifs04:
             let product = run.hour == 0 || run.hour == 12 ? "oper" : "scda"
-            return "\(base)\(dateStr)/\(runStr)z/0p4-beta/\(product)/\(dateStr)\(runStr)0000-\(hour)h-\(product)-fc.grib2"
+            return "\(base)\(dateStr)/\(runStr)z/ifs/0p4-beta/\(product)/\(dateStr)\(runStr)0000-\(hour)h-\(product)-fc.grib2"
         case .ifs04_ensemble:
-            return "\(base)\(dateStr)/\(runStr)z/0p4-beta/enfo/\(dateStr)\(runStr)0000-\(hour)h-enfo-ef.grib2"
+            return "\(base)\(dateStr)/\(runStr)z/ifs/0p4-beta/enfo/\(dateStr)\(runStr)0000-\(hour)h-enfo-ef.grib2"
+        case .ifs025:
+            let product = run.hour == 0 || run.hour == 12 ? "oper" : "scda"
+            return "\(base)\(dateStr)/\(runStr)z/ifs/0p25/\(product)/\(dateStr)\(runStr)0000-\(hour)h-\(product)-fc.grib2"
+        case .ifs025_ensemble:
+            return "\(base)\(dateStr)/\(runStr)z/ifs/0p25/enfo/\(dateStr)\(runStr)0000-\(hour)h-enfo-ef.grib2"
+        case .aifs025:
+            let product = "oper"// run.hour == 0 || run.hour == 12 ? "oper" : "scda"
+            return "\(base)\(dateStr)/\(runStr)z/aifs/0p25/\(product)/\(dateStr)\(runStr)0000-\(hour)h-\(product)-fc.grib2"
         }
     }
 }

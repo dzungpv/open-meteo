@@ -7,138 +7,90 @@ import Vapor
  Endpoint https://ensemble-api.open-meteo.com/v1/ensemble?latitude=52.52&longitude=13.41&models=icon_seamless&hourly=temperature_2m
  */
 public struct EnsembleApiController {
-    func query(_ req: Request) throws -> EventLoopFuture<Response> {
-        try req.ensureSubdomain("ensemble-api")
-        let generationTimeStart = Date()
-        let params = try req.query.decode(EnsembleApiQuery.self)
-        try params.validate()
-        let elevationOrDem = try params.elevation ?? Dem90.read(lat: params.latitude, lon: params.longitude)
+    func query(_ req: Request) async throws -> Response {
+        try await req.ensureSubdomain("ensemble-api")
+        let params = req.method == .POST ? try req.content.decode(ApiQueryParameter.self) : try req.query.decode(ApiQueryParameter.self)
+        try req.ensureApiKey("ensemble-api", apikey: params.apikey)
         let currentTime = Timestamp.now()
-        
         let allowedRange = Timestamp(2023, 4, 1) ..< currentTime.add(86400 * 35)
-        let timezone = try params.resolveTimezone()
-        let (utcOffsetSecondsActual, time) = try params.getTimerange(timezone: timezone, current: currentTime, forecastDays: params.forecast_days ?? 7, allowedRange: allowedRange)
-        /// For fractional timezones, shift data to show only for full timestamps
-        let utcOffsetShift = time.utcOffsetSeconds - utcOffsetSecondsActual
         
-        let hourlyTime = time.range.range(dtSeconds: 3600)
-        //let dailyTime = time.range.range(dtSeconds: 3600*24)
-        
-        let domains = try EnsembleMultiDomains.load(commaSeparated: params.models)
-        
-        let readers = try domains.compactMap {
-            try GenericReaderMulti<EnsembleVariable>(domain: $0, lat: params.latitude, lon: params.longitude, elevation: elevationOrDem, mode: params.cell_selection ?? .land)
-        }
-        
-        guard !readers.isEmpty else {
-            throw ForecastapiError.noDataAvilableForThisLocation
-        }
-        
+        let prepared = try params.prepareCoordinates(allowTimezones: true)
+        let domains = try EnsembleMultiDomains.load(commaSeparatedOptional: params.models) ?? [.gfs_seamless]
         let paramsHourly = try EnsembleVariableWithoutMember.load(commaSeparatedOptional: params.hourly)
-        //let paramsDaily = try EnsembleVariableDaily.load(commaSeparatedOptional: params.daily)
+        let nVariables = (paramsHourly?.count ?? 0) * domains.reduce(0, {$0 + $1.countEnsembleMember})
         
-        // Run query on separat thread pool to not block the main pool
-        return ForecastapiController.runLoop.next().submit({
-            // Start data prefetch to boooooooost API speed :D
-            if let hourlyVariables = paramsHourly {
-                for reader in readers {
-                    let variables = hourlyVariables.flatMap { variable in
-                        (0..<reader.domain.countEnsembleMember).map {
-                            EnsembleVariable(variable, $0)
-                        }
-                    }
-                    try reader.prefetchData(variables: variables, time: hourlyTime)
-                }
-            }
-            /*if let dailyVariables = paramsDaily {
-             for reader in readers {
-             try reader.prefetchData(variables: dailyVariables, time: dailyTime)
-             }
-             }*/
+        let locations: [ForecastapiResult<EnsembleMultiDomains>.PerLocation] = try prepared.map { prepared in
+            let coordinates = prepared.coordinate
+            let timezone = prepared.timezone
+            let time = try params.getTimerange2(timezone: timezone, current: currentTime, forecastDaysDefault: 7, forecastDaysMax: 35, startEndDate: prepared.startEndDate, allowedRange: allowedRange, pastDaysMax: 92)
+            let timeLocal = TimerangeLocal(range: time.dailyRead.range, utcOffsetSeconds: timezone.utcOffsetSeconds)
             
-            let hourly: ApiSection? = try paramsHourly.map { variables in
-                var res = [ApiColumn]()
-                res.reserveCapacity(variables.count * readers.reduce(0, {$0 + $1.domain.countEnsembleMember}))
-                for reader in readers {
-                    for variable in variables {
-                        for member in 0..<reader.domain.countEnsembleMember {
-                            let variable = EnsembleVariable(variable, member)
-                            let name = readers.count > 1 ? "\(variable.rawValue)_\(reader.domain.rawValue)" : "\(variable.rawValue)"
-                            guard let d = try reader.get(variable: variable, time: hourlyTime)?.convertAndRound(params: params).toApi(name: name) else {
-                                continue
+            let readers: [ForecastapiResult<EnsembleMultiDomains>.PerModel] = try domains.compactMap { domain in
+                guard let reader = try GenericReaderMulti<EnsembleVariable>(domain: domain, lat: coordinates.latitude, lon: coordinates.longitude, elevation: coordinates.elevation, mode: params.cell_selection ?? .land, options: params.readerOptions) else {
+                    return nil
+                }
+                return .init(
+                    model: domain,
+                    latitude: reader.modelLat,
+                    longitude: reader.modelLon,
+                    elevation: reader.targetElevation,
+                    prefetch: {
+                        if let hourlyVariables = paramsHourly {
+                            for variable in hourlyVariables {
+                                for member in 0..<reader.domain.countEnsembleMember {
+                                    try reader.prefetchData(variable: variable, time: time.hourlyRead.toSettings(ensembleMemberLevel: member))
+                                }
                             }
-                            assert(hourlyTime.count == d.data.count)
-                            res.append(d)
                         }
-                        
-                    }
-                }
-                return ApiSection(name: "hourly", time: hourlyTime.add(utcOffsetShift), columns: res)
+                    },
+                    current: nil,
+                    hourly: paramsHourly.map { variables in
+                        return {
+                            return .init(name: "hourly", time: time.hourlyDisplay, columns: try variables.compactMap { variable in
+                                var unit: SiUnit? = nil
+                                let allMembers: [ApiArray] = try (0..<reader.domain.countEnsembleMember).compactMap { member in
+                                    guard let d = try reader.get(variable: variable, time: time.hourlyRead.toSettings(ensembleMemberLevel: member))?.convertAndRound(params: params) else {
+                                        return nil
+                                    }
+                                    unit = d.unit
+                                    assert(time.hourlyRead.count == d.data.count)
+                                    return ApiArray.float(d.data)
+                                }
+                                guard allMembers.count > 0 else {
+                                    return nil
+                                }
+                                return .init(variable: variable.resultVariable, unit: unit ?? .undefined, variables: allMembers)
+                            })
+                        }
+                    },
+                    daily: nil,
+                    sixHourly: nil,
+                    minutely15: nil
+                )
             }
-            
-            let daily: ApiSection? = nil
-            
-            let generationTimeMs = Date().timeIntervalSince(generationTimeStart) * 1000
-            let out = ForecastapiResult(
-                latitude: readers[0].modelLat,
-                longitude: readers[0].modelLon,
-                elevation: readers[0].targetElevation,
-                generationtime_ms: generationTimeMs,
-                utc_offset_seconds: utcOffsetSecondsActual,
-                timezone: timezone,
-                current_weather: nil,
-                sections: [hourly, daily].compactMap({$0}),
-                timeformat: params.timeformatOrDefault
-            )
-            return try out.response(format: params.format ?? .json)
-        })
+            guard !readers.isEmpty else {
+                throw ForecastapiError.noDataAvilableForThisLocation
+            }
+            return .init(timezone: timezone, time: timeLocal, locationId: coordinates.locationId, results: readers)
+        }
+        let result = ForecastapiResult<EnsembleMultiDomains>(timeformat: params.timeformatOrDefault, results: locations)
+        await req.incrementRateLimiter(weight: result.calculateQueryWeight(nVariablesModels: nVariables))
+        return try await result.response(format: params.format ?? .json)
+    }
+}
+
+extension EnsembleVariableWithoutMember {
+    var resultVariable: ForecastapiResult<EnsembleMultiDomains>.SurfaceAndPressureVariable {
+        switch self {
+        case .pressure(let p):
+            return .pressure(.init(p.variable, p.level))
+        case .surface(let s):
+            return .surface(s)
+        }
     }
 }
 
 
-
-struct EnsembleApiQuery: Content, QueryWithStartEndDateTimeZone, ApiUnitsSelectable {
-    let latitude: Float
-    let longitude: Float
-    let hourly: [String]?
-    let daily: [String]?
-    let elevation: Float?
-    let timezone: String?
-    let temperature_unit: TemperatureUnit?
-    let windspeed_unit: WindspeedUnit?
-    let precipitation_unit: PrecipitationUnit?
-    let length_unit: LengthUnit?
-    let timeformat: Timeformat?
-    let past_days: Int?
-    let forecast_days: Int?
-    let format: ForecastResultFormat?
-    let models: [String]
-    let cell_selection: GridSelectionMode?
-    
-    /// iso starting date `2022-02-01`
-    let start_date: IsoDate?
-    /// included end date `2022-06-01`
-    let end_date: IsoDate?
-    
-    func validate() throws {
-        if latitude > 90 || latitude < -90 || latitude.isNaN {
-            throw ForecastapiError.latitudeMustBeInRangeOfMinus90to90(given: latitude)
-        }
-        if longitude > 180 || longitude < -180 || longitude.isNaN {
-            throw ForecastapiError.longitudeMustBeInRangeOfMinus180to180(given: longitude)
-        }
-        if daily?.count ?? 0 > 0 && timezone == nil {
-            throw ForecastapiError.timezoneRequired
-        }
-        if let forecast_days = forecast_days, forecast_days < 0 || forecast_days > 35 {
-            throw ForecastapiError.forecastDaysInvalid(given: forecast_days, allowed: 0...35)
-        }
-    }
-    
-    var timeformatOrDefault: Timeformat {
-        return timeformat ?? .iso8601
-    }
-}
 
 /**
 List of ensemble models. "Seamless" models combine global with local models. A best_match model is not possible, as all models are too different to give any advice
@@ -150,8 +102,11 @@ enum EnsembleMultiDomains: String, RawRepresentableString, CaseIterable, MultiDo
     case icon_d2
     
     case ecmwf_ifs04
+    case ecmwf_ifs025
     
     case gem_global
+    
+    case bom_access_global_ensemble
     
     case gfs_seamless
     case gfs025
@@ -160,26 +115,30 @@ enum EnsembleMultiDomains: String, RawRepresentableString, CaseIterable, MultiDo
 
     /// Return the required readers for this domain configuration
     /// Note: last reader has highes resolution data
-    func getReader(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode) throws -> [any GenericReaderProtocol] {
+    func getReader(lat: Float, lon: Float, elevation: Float, mode: GridSelectionMode, options: GenericReaderOptions) throws -> [any GenericReaderProtocol] {
         switch self {
         case .icon_seamless:
-            return try IconMixer(domains: [.iconEps, .iconEuEps, .iconD2Eps], lat: lat, lon: lon, elevation: elevation, mode: mode)?.reader ?? []
+            return try IconMixer(domains: [.iconEps, .iconEuEps, .iconD2Eps], lat: lat, lon: lon, elevation: elevation, mode: mode, options: options)?.reader ?? []
         case .icon_global:
-            return try IconReader(domain: .iconEps, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+            return try IconReader(domain: .iconEps, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
         case .icon_eu:
-            return try IconReader(domain: .iconEuEps, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+            return try IconReader(domain: .iconEuEps, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
         case .icon_d2:
-            return try IconReader(domain: .iconD2Eps, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+            return try IconReader(domain: .iconD2Eps, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
         case .ecmwf_ifs04:
-            return try EcmwfReader(domain: .ifs04_ensemble, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+            return try EcmwfReader(domain: .ifs04_ensemble, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
+        case .ecmwf_ifs025:
+            return try EcmwfReader(domain: .ifs025_ensemble, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
         case .gfs025:
-            return try GfsReader(domain: .gfs025_ens, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+            return try GfsReader(domain: .gfs025_ens, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
         case .gfs05:
-            return try GfsReader(domain: .gfs05_ens, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+            return try GfsReader(domain: .gfs05_ens, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
         case .gfs_seamless:
-            return try GfsMixer(domains: [.gfs05_ens, .gfs025_ens], lat: lat, lon: lon, elevation: elevation, mode: mode)?.reader ?? []
+            return try GfsMixer(domains: [.gfs05_ens, .gfs025_ens], lat: lat, lon: lon, elevation: elevation, mode: mode, options: options)?.reader ?? []
         case .gem_global:
-            return try GemReader(domain: .gem_global_ensemble, lat: lat, lon: lon, elevation: elevation, mode: mode).flatMap({[$0]}) ?? []
+            return try GemReader(domain: .gem_global_ensemble, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
+        case .bom_access_global_ensemble:
+            return try BomReader(domain: .access_global_ensemble, lat: lat, lon: lon, elevation: elevation, mode: mode, options: options).flatMap({[$0]}) ?? []
         }
     }
     
@@ -196,6 +155,8 @@ enum EnsembleMultiDomains: String, RawRepresentableString, CaseIterable, MultiDo
             return IconDomains.iconD2Eps.ensembleMembers
         case .ecmwf_ifs04:
             return EcmwfDomain.ifs04_ensemble.ensembleMembers
+        case .ecmwf_ifs025:
+            return EcmwfDomain.ifs025_ensemble.ensembleMembers
         case .gfs025:
             return GfsDomain.gfs025_ens.ensembleMembers
         case .gfs05:
@@ -204,25 +165,32 @@ enum EnsembleMultiDomains: String, RawRepresentableString, CaseIterable, MultiDo
             return GfsDomain.gfs05_ens.ensembleMembers
         case .gem_global:
             return GemDomain.gem_global_ensemble.ensembleMembers
+        case .bom_access_global_ensemble:
+            return BomDomain.access_global_ensemble.ensembleMembers
         }
     }
 }
 
 
 /// Define all available surface weather variables
-enum EnsembleSurfaceVariable: String, GenericVariableMixable {
+enum EnsembleSurfaceVariable: String, GenericVariableMixable, Equatable, RawRepresentableString {
     case weathercode
+    case weather_code
     case temperature_2m
     case temperature_80m
     case temperature_120m
     case cloudcover
+    case cloud_cover
     case pressure_msl
     case relativehumidity_2m
+    case relative_humidity_2m
     case precipitation
     //case showers
     case rain
     case windgusts_10m
+    case wind_gusts_10m
     case dewpoint_2m
+    case dew_point_2m
     case diffuse_radiation
     case direct_radiation
     case apparent_temperature
@@ -232,22 +200,30 @@ enum EnsembleSurfaceVariable: String, GenericVariableMixable {
     case winddirection_80m
     case windspeed_120m
     case winddirection_120m
+    case wind_speed_10m
+    case wind_direction_10m
+    case wind_speed_80m
+    case wind_direction_80m
+    case wind_speed_120m
+    case wind_direction_120m
     case direct_normal_irradiance
     case et0_fao_evapotranspiration
+    case vapour_pressure_deficit
     case vapor_pressure_deficit
     case shortwave_radiation
     case snowfall
     case snow_depth
     case surface_pressure
-    //case terrestrial_radiation
-    //case terrestrial_radiation_instant
     case shortwave_radiation_instant
     case diffuse_radiation_instant
     case direct_radiation_instant
     case direct_normal_irradiance_instant
+    case global_tilted_irradiance
+    case global_tilted_irradiance_instant
     case is_day
     case visibility
     case freezinglevel_height
+    case freezing_level_height
     case uv_index
     case uv_index_clear_sky
     case cape
@@ -263,10 +239,17 @@ enum EnsembleSurfaceVariable: String, GenericVariableMixable {
     case soil_moisture_40_to_100cm
     case soil_moisture_100_to_200cm
     
+    case sunshine_duration
+    
     /// Soil moisture or snow depth are cumulative processes and have offests if mutliple models are mixed
     var requiresOffsetCorrectionForMixing: Bool {
         switch self {
-        default: return false
+        case .soil_moisture_0_to_10cm, .soil_moisture_10_to_40cm, .soil_moisture_40_to_100cm, .soil_moisture_100_to_200cm:
+            return true
+        case .snow_depth:
+            return true
+        default:
+            return false
         }
     }
 }
@@ -276,10 +259,15 @@ enum EnsemblePressureVariableType: String, GenericVariableMixable {
     case temperature
     case geopotential_height
     case relativehumidity
+    case relative_humidity
     case windspeed
+    case wind_speed
     case winddirection
+    case wind_direction
     case dewpoint
+    case dew_point
     case cloudcover
+    case cloud_cover
     case vertical_velocity
     
     var requiresOffsetCorrectionForMixing: Bool {
@@ -298,7 +286,7 @@ struct EnsemblePressureVariable: PressureVariableRespresentable, GenericVariable
 
 typealias EnsembleVariableWithoutMember = SurfaceAndPressureVariable<EnsembleSurfaceVariable, EnsemblePressureVariable>
 
-typealias EnsembleVariable = VariableAndMemberAndControl<EnsembleVariableWithoutMember>
+typealias EnsembleVariable = EnsembleVariableWithoutMember
 
 /// Available daily aggregations
 /*enum EnsembleVariableDaily: String, DailyVariableCalculatable, RawRepresentableString {

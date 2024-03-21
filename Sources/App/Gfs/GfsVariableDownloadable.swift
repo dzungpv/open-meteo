@@ -1,12 +1,12 @@
 /// Required additions to a GFS variable to make it downloadable
 protocol GfsVariableDownloadable: GenericVariable {
-    func gribIndexName(for domain: GfsDomain) -> String?
+    func gribIndexName(for domain: GfsDomain, timestep: Int?) -> String?
     func skipHour0(for domain: GfsDomain) -> Bool
     func multiplyAdd(domain: GfsDomain) -> (multiply: Float, add: Float)?
 }
 
 extension GfsSurfaceVariable: GfsVariableDownloadable {
-    func gribIndexName(for domain: GfsDomain) -> String? {
+    func gribIndexName(for domain: GfsDomain, timestep: Int?) -> String? {
         switch domain {
         case .gfs013:
             // gfs013 https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20230510/00/atmos/gfs.t00z.sfluxgrbf000.grib2.idx
@@ -15,15 +15,15 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":TMP:2 m above ground:"
             case .surface_temperature:
                 return ":TMP:surface:"
-            case .cloudcover:
+            case .cloud_cover:
                 return ":TCDC:entire atmosphere:"
-            case .cloudcover_low:
+            case .cloud_cover_low:
                 return ":LCDC:low cloud layer:"
-            case .cloudcover_mid:
+            case .cloud_cover_mid:
                 return ":MCDC:middle cloud layer:"
-            case .cloudcover_high:
+            case .cloud_cover_high:
                 return ":HCDC:high cloud layer:"
-            case .relativehumidity_2m:
+            case .relative_humidity_2m:
                 // use specific humidity and convert to relative humidity
                 return ":SPFH:2 m above ground:"
             case .pressure_msl:
@@ -54,9 +54,9 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":SOILW:1-2 m below ground:"
             case .snow_depth:
                 return ":SNOD:surface:"
-            case .sensible_heatflux:
+            case .sensible_heat_flux:
                 return ":SHTFL:surface:"
-            case .latent_heatflux:
+            case .latent_heat_flux:
                 return ":LHTFL:surface:"
             case .showers:
                 return ":CPRAT:surface:"
@@ -94,14 +94,16 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":VGRD:100 m above ground:"
             case .wind_u_component_100m:
                 return ":UGRD:100 m above ground:"
-            case .windgusts_10m:
+            case .wind_gusts_10m:
                 return ":GUST:surface:"
-            case .freezinglevel_height:
+            case .freezing_level_height:
                 return ":HGT:0C isotherm:"
             case .cape:
                 return ":CAPE:surface:"
             case .lifted_index:
                 return ":LFTX:surface:"
+            case .convective_inhibition:
+                return ":CIN:surface:"
             case .visibility:
                 return ":VIS:surface:"
             default:
@@ -121,15 +123,15 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return nil
             case .temperature_2m:
                 return ":TMP:2 m above ground:"
-            case .cloudcover:
+            case .cloud_cover:
                 return ":TCDC:entire atmosphere:"
-            case .cloudcover_low:
+            case .cloud_cover_low:
                 return ":LCDC:low cloud layer:"
-            case .cloudcover_mid:
+            case .cloud_cover_mid:
                 return ":MCDC:middle cloud layer:"
-            case .cloudcover_high:
+            case .cloud_cover_high:
                 return ":HCDC:high cloud layer:"
-            case .relativehumidity_2m:
+            case .relative_humidity_2m:
                 return ":RH:2 m above ground:"
             case .precipitation:
                 return ":PRATE:surface:"
@@ -145,17 +147,19 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":TMP:surface:"
             case .snow_depth:
                 return ":SNOD:surface:"
-            case .sensible_heatflux:
+            case .sensible_heat_flux:
                 return ":SHTFL:surface:"
-            case .latent_heatflux:
+            case .latent_heat_flux:
                 return ":LHTFL:surface:"
+            case .convective_inhibition:
+                return ":CIN:surface:"
             case .frozen_precipitation_percent:
                 return ":CPOFP:surface"
             case .categorical_freezing_rain:
-                return ":CFRZR:"
-            case .windgusts_10m:
+                return ":CFRZR:surface:"
+            case .wind_gusts_10m:
                 return ":GUST:surface:"
-            case .freezinglevel_height:
+            case .freezing_level_height:
                 return ":HGT:0C isotherm:"
             case .shortwave_radiation:
                 return ":DSWRF:surface:"
@@ -167,6 +171,42 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":VIS:surface:"
             case .precipitation_probability:
                 return nil
+            default:
+                return nil
+            }
+        case .hrrr_conus_15min:
+            guard let timestep else {
+                return nil
+            }
+            let avg15 = timestep == 0 ? "anl" : "\(timestep-15)-\(timestep) min ave fcst"
+            let fcst = timestep == 0 ? "anl" : "\(timestep) min fcst"
+            switch self {
+            case .temperature_2m:
+                return ":TMP:2 m above ground:\(fcst):"
+            case .precipitation:
+                return ":PRATE:surface:\(fcst):"
+            case .frozen_precipitation_percent:
+                return ":CPOFP:surface:\(fcst):"
+            case .categorical_freezing_rain:
+                return ":CFRZR:surface:\(fcst):"
+            case .wind_gusts_10m:
+                return ":GUST:surface:\(fcst):"
+            case .wind_v_component_10m:
+                return ":VGRD:10 m above ground:\(fcst):"
+            case .wind_u_component_10m:
+                return ":UGRD:10 m above ground:\(fcst):"
+            case .wind_v_component_80m:
+                return ":VGRD:80 m above ground:\(fcst):"
+            case .wind_u_component_80m:
+                return ":UGRD:80 m above ground:\(fcst):"
+            case .shortwave_radiation:
+                // 15 min backwards averaged
+                return ":DSWRF:surface:\(avg15):"
+            case .diffuse_radiation:
+                // instantanous, will be backwards averaged later
+                return ":VDDSF:surface:\(fcst):"
+            case .visibility:
+                return ":VIS:surface:\(fcst):"
             default:
                 return nil
             }
@@ -182,7 +222,7 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
             switch self {
             case .visibility:
                 return ":VIS:surface:"
-            case .windgusts_10m:
+            case .wind_gusts_10m:
                 return ":GUST:surface:"
             case .pressure_msl:
                 return ":MSLET:mean sea level:"
@@ -194,7 +234,7 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":SNOD:surface:"
             case .temperature_2m:
                 return ":TMP:2 m above ground:"
-            case .relativehumidity_2m:
+            case .relative_humidity_2m:
                 return ":RH:2 m above ground:"
             case .wind_u_component_10m:
                 return ":UGRD:10 m above ground:"
@@ -206,13 +246,15 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":APCP:surface:"
             case .categorical_freezing_rain:
                 return ":CFRZR:surface:"
-            case .latent_heatflux:
+            case .latent_heat_flux:
                 return ":LHTFL:surface:"
-            case .sensible_heatflux:
+            case .sensible_heat_flux:
                 return ":SHTFL:surface:"
+            case .convective_inhibition:
+                return ":CIN:surface:"
             case .cape:
                 return ":CAPE:surface:"
-            case .cloudcover:
+            case .cloud_cover:
                 return ":TCDC:entire atmosphere:"
             case .shortwave_radiation:
                 return ":DSWRF:surface:"
@@ -224,7 +266,7 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
             switch self {
             case .visibility:
                 return ":VIS:surface:"
-            case .windgusts_10m:
+            case .wind_gusts_10m:
                 return ":GUST:surface:"
             case .pressure_msl:
                 return ":MSLET:mean sea level:"
@@ -236,7 +278,7 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":TMP:80 m above ground:"
             case .temperature_100m:
                 return ":TMP:100 m above ground:"
-            case .relativehumidity_2m:
+            case .relative_humidity_2m:
                 return ":RH:2 m above ground:"
             case .wind_u_component_10m:
                 return ":UGRD:10 m above ground:"
@@ -256,19 +298,21 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 return ":APCP:surface:"
             case .categorical_freezing_rain:
                 return ":CFRZR:surface:"
-            case .latent_heatflux:
+            case .latent_heat_flux:
                 return ":LHTFL:surface:"
-            case .sensible_heatflux:
+            case .sensible_heat_flux:
                 return ":SHTFL:surface:"
             case .cape:
                 return ":CAPE:surface:"
-            case .cloudcover:
+            case .cloud_cover:
                 return ":TCDC:entire atmosphere:"
             case .shortwave_radiation:
                 return ":DSWRF:surface:"
             case .lifted_index:
                 return ":LFTX:surface:"
-            case .freezinglevel_height:
+            case .convective_inhibition:
+                return ":CIN:surface:"
+            case .freezing_level_height:
                 return ":HGT:0C isotherm:"
             case .surface_temperature:
                 return ":TMP:surface:"
@@ -299,21 +343,31 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
     }
     
     func skipHour0(for domain: GfsDomain) -> Bool {
+        if domain == .hrrr_conus_15min {
+            switch self {
+            case .shortwave_radiation:
+                return true
+            case .diffuse_radiation:
+                return true
+            default:
+                return false
+            }
+        }
         switch self {
         case .precipitation_probability: return true
         case .precipitation: return true
         case .categorical_freezing_rain: return true
-        case .sensible_heatflux: return true
-        case .latent_heatflux: return true
+        case .sensible_heat_flux: return true
+        case .latent_heat_flux: return true
         case .showers: return true
         case .shortwave_radiation: return true
         case .diffuse_radiation: return true
         case .uv_index: return true
         case .uv_index_clear_sky: return true
-        case .cloudcover: fallthrough // cloud cover not available in hour 0 in GFS013
-        case .cloudcover_low: fallthrough
-        case .cloudcover_mid: fallthrough
-        case .cloudcover_high: return domain == .gfs013 || domain == .gfs025_ens || domain == .gfs05_ens
+        case .cloud_cover: fallthrough // cloud cover not available in hour 0 in GFS013
+        case .cloud_cover_low: fallthrough
+        case .cloud_cover_mid: fallthrough
+        case .cloud_cover_high: return domain == .gfs013 || domain == .gfs025_ens || domain == .gfs05_ens
         default: return false
         }
     }
@@ -346,6 +400,8 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
                 fallthrough
             case .gfs025:
                 fallthrough
+            case .hrrr_conus_15min:
+                fallthrough
             case .hrrr_conus:
                 // precipitation rate per second to hourly precipitation
                 return (Float(domain.dtSeconds), 0)
@@ -370,7 +426,7 @@ extension GfsSurfaceVariable: GfsVariableDownloadable {
 }
 
 extension GfsPressureVariable: GfsVariableDownloadable {
-    func gribIndexName(for domain: GfsDomain) -> String? {
+    func gribIndexName(for domain: GfsDomain, timestep: Int?) -> String? {
         switch variable {
         case .temperature:
             return ":TMP:\(level) mb:"
@@ -380,7 +436,7 @@ extension GfsPressureVariable: GfsVariableDownloadable {
             return ":VGRD:\(level) mb:"
         case .geopotential_height:
             return ":HGT:\(level) mb:"
-        case .cloudcover:
+        case .cloud_cover:
             if domain != .gfs025 {
                 // no cloud cover in HRRR and NAM
                 return nil
@@ -389,7 +445,7 @@ extension GfsPressureVariable: GfsVariableDownloadable {
                 return nil
             }
             return ":TCDC:\(level) mb:"
-        case .relativehumidity:
+        case .relative_humidity:
             return ":RH:\(level) mb:"
         case .vertical_velocity:
             switch domain {
@@ -399,6 +455,8 @@ extension GfsPressureVariable: GfsVariableDownloadable {
                 // Vertical Velocity (Geometric) [m/s]
                 return ":DZDT:\(level) mb:"
             case .gfs05_ens:
+                fallthrough
+            case .hrrr_conus_15min:
                 fallthrough
             case .hrrr_conus:
                 // Vertical Velocity (Pressure) [Pa/s]

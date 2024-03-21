@@ -18,6 +18,8 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
     //case nam_conus // disabled because it only add 12 forecast hours
     case hrrr_conus
     
+    case hrrr_conus_15min
+    
     /// Only used for precipitation probability on the fly
     case gfs025_ensemble
     
@@ -28,17 +30,61 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
     /// 0.5° ensemble version for up to 25 days of forecast... Low forecast skill obviously.
     case gfs05_ens
     
-    var omfileDirectory: String {
-        return "\(OpenMeteo.dataDictionary)omfile-\(rawValue)/"
+    var domainRegistry: DomainRegistry {
+        switch self {
+        case .gfs013:
+            return .ncep_gfs013
+        case .gfs025:
+            return .ncep_gfs025
+        case .hrrr_conus:
+            return .ncep_hrrr_conus
+        case .hrrr_conus_15min:
+            return .ncep_hrrr_conus_15min
+        case .gfs025_ensemble:
+            return .ncep_gefs025_probability
+        case .gfs025_ens:
+            return .ncep_gefs025
+        case .gfs05_ens:
+            return .ncep_gefs05
+        }
     }
-    var downloadDirectory: String {
-        return "\(OpenMeteo.dataDictionary)download-\(rawValue)/"
+    
+    var domainRegistryStatic: DomainRegistry? {
+        switch self {
+        case .hrrr_conus_15min:
+            return .ncep_hrrr_conus
+        case .gfs025_ensemble:
+            return .ncep_gefs025
+        default:
+            return domainRegistry
+        }
     }
-    var omfileArchive: String? {
+    
+    var hasYearlyFiles: Bool {
+        return false
+    }
+    
+    var masterTimeRange: Range<Timestamp>? {
         return nil
     }
-    var omFileMaster: (path: String, time: TimerangeDt)? {
-        return nil
+    
+    var runsPerDay: Int {
+        switch self {
+        case .gfs013:
+            return 4
+        case .gfs025:
+            return 4
+        case .hrrr_conus:
+            return 24
+        case .hrrr_conus_15min:
+            return 24
+        case .gfs025_ensemble:
+            return 4
+        case .gfs025_ens:
+            return 4
+        case .gfs05_ens:
+            return 4
+        }
     }
     
     var dtSeconds: Int {
@@ -55,6 +101,8 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
             return 3*3600
         case .gfs05_ens:
             return 3*3600
+        case .hrrr_conus_15min:
+            return 3600/4
         }
     }
     
@@ -72,30 +120,8 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
             return true
         case .gfs05_ens:
             return true
-        }
-    }
-    
-    func getStaticFile(type: ReaderStaticVariable) -> OmFileReader<MmapFile>? {
-        switch type {
-        case .soilType:
-            return nil
-        case .elevation:
-            switch self {
-            case .gfs05_ens:
-                return Self.gfs05ensElevationFile
-            case .gfs013:
-                return Self.gfs013ElevationFile
-            case .gfs025_ens:
-                return Self.gfs025ensElevationFile
-            case .gfs025_ensemble:
-                fallthrough
-            case .gfs025:
-                return Self.gfs025ElevationFile
-                //case .nam_conus:
-                //return Self.namConusElevationFile
-            case .hrrr_conus:
-                return Self.hrrrConusElevationFile
-            }
+        case .hrrr_conus_15min:
+            return false
         }
     }
     
@@ -117,22 +143,13 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
         //case .nam_conus:
             // NAM has a delay of 1:40 hours after initialisation. Cronjob starts at 1:40
             //return ((t.hour - 1 + 24) % 24) / 6 * 6
+        case .hrrr_conus_15min:
+            fallthrough
         case .hrrr_conus:
             // HRRR has a delay of 55 minutes after initlisation. Cronjob starts at xx:55
             return t.with(hour: t.hour)
+
         }
-    }
-    
-    private static var gfs013ElevationFile = try? OmFileReader(file: Self.gfs013.surfaceElevationFileOm)
-    private static var gfs025ElevationFile = try? OmFileReader(file: Self.gfs025.surfaceElevationFileOm)
-    //private static var namConusElevationFile = try? OmFileReader(file: Self.nam_conus.surfaceElevationFileOm)
-    private static var hrrrConusElevationFile = try? OmFileReader(file: Self.hrrr_conus.surfaceElevationFileOm)
-    private static var gfs025ensElevationFile = try? OmFileReader(file: Self.gfs025_ens.surfaceElevationFileOm)
-    private static var gfs05ensElevationFile = try? OmFileReader(file: Self.gfs05_ens.surfaceElevationFileOm)
-    
-    /// Filename of the surface elevation file
-    var surfaceElevationFileOm: String {
-        "\(omfileDirectory)HSURF.om"
     }
     
     var ensembleMembers: Int {
@@ -166,6 +183,8 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
             //return Array(0...60)
         case .hrrr_conus:
             return (run % 6 == 0) ? Array(0...48) : Array(0...18)
+        case .hrrr_conus_15min:
+            return Array(0...18*4)
         }
     }
     
@@ -185,14 +204,20 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
         case .gfs013:
             return []
         case .gfs025:
-            return [10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 925, 950, 975, 1000]
+            // pgrb2
+            // let all = [0.01, 0.02, 0.04, 0.07, 0.1, 0.2, 0.4, 0.7, 1, 2, 3, 5, 7, 10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 925, 975, 1000]
+            // pgrb2b
+            return [10, 15, 20, 30, 40, 50, 70, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600, 625, 650, 675, 700, 725, 750, 775, 800, 825, 850, 875, 900, 925, 950, 975, 1000]
         //case .nam_conus:
             // nam uses level 75 instead of 70. Level 15 and 40 missing. Only use the same levels as HRRR.
             //return [                            100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 925, 950, 975, 1000] // disabled: 50, 75,
         case .hrrr_conus:
-            return [                            100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 925, 950, 975, 1000]  // disabled: 50, 75,
+            // Note: HRRR uses level 70 instead of 75
+            return [                           50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600, 625, 650, 675, 700, 725, 750, 775, 800, 825, 850, 875, 900, 925, 950, 975, 1000]
             // all available
             //return [50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500, 525, 550, 575, 600, 625, 650, 675, 700, 725, 750, 775, 800, 825, 850, 875, 900, 925, 950, 975, 1000]
+        case .hrrr_conus_15min:
+            return []
         }
         
     }
@@ -213,6 +238,8 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
             return 384 + 1 + 4*24
         case .hrrr_conus:
             return 48 + 1 + 4*24
+        case .hrrr_conus_15min:
+            return 48*4*2
         }
     }
     
@@ -233,6 +260,8 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
             /// labert conforomal grid https://www.emc.ncep.noaa.gov/mmb/namgrids/hrrrspecs.html
             let proj = LambertConformalConicProjection(λ0: -97.5, ϕ0: 0, ϕ1: 38.5)
             return LambertConformalGrid(nx: 1799, ny: 1059, latitude: 21.138...47.8424, longitude: (-122.72)...(-60.918), projection: proj)*/
+        case .hrrr_conus_15min:
+            fallthrough
         case .hrrr_conus:
             let proj = LambertConformalConicProjection(λ0: -97.5, ϕ0: 0, ϕ1: 38.5, ϕ2: 38.5)
             return ProjectionGrid(nx: 1799, ny: 1059, latitude: 21.138...47.8424, longitude: (-122.72)...(-60.918), projection: proj)
@@ -250,30 +279,41 @@ enum GfsDomain: String, GenericDomain, CaseIterable {
         let useArchive = (Timestamp.now().timeIntervalSince1970 - run.timeIntervalSince1970) > 36*3600
         /// 4 week archive
         let gfsAws = "https://noaa-gfs-bdp-pds.s3.amazonaws.com/"
+        
         let gfsNomads = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
         let yyyymmdd = run.format_YYYYMMdd
         let hh = run.hh
+        
+        let gefsAws = "https://noaa-gefs-pds.s3.amazonaws.com/"
+        let gefsNomads = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/"
+        let gefsServer = useArchive ? gefsAws : gefsNomads
+        
+        let hrrrNomads = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/"
+        let hrrrAws = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/"
+        let hrrrServer = useArchive ? hrrrAws : hrrrNomads
+        
         switch self {
         case .gfs05_ens:
             let memberString = member == 0 ? "gec00" : "gep\(member.zeroPadded(len: 2))"
-            return ["https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/gefs.\(yyyymmdd)/\(hh)/atmos/pgrb2ap5/\(memberString).t\(hh)z.pgrb2a.0p50.f\(fHHH)",
-                    "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/gefs.\(yyyymmdd)/\(hh)/atmos/pgrb2bp5/\(memberString).t\(hh)z.pgrb2b.0p50.f\(fHHH)"]
+            return ["\(gefsServer)gefs.\(yyyymmdd)/\(hh)/atmos/pgrb2ap5/\(memberString).t\(hh)z.pgrb2a.0p50.f\(fHHH)",
+                    "\(gefsServer)gefs.\(yyyymmdd)/\(hh)/atmos/pgrb2bp5/\(memberString).t\(hh)z.pgrb2b.0p50.f\(fHHH)"]
         case .gfs025_ensemble:
             fallthrough
         case .gfs025_ens:
             let memberString = member == 0 ? "gec00" : "gep\(member.zeroPadded(len: 2))"
-            return ["https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/gefs.\(yyyymmdd)/\(hh)/atmos/pgrb2sp25/\(memberString).t\(hh)z.pgrb2s.0p25.f\(fHHH)"]
+            return ["\(gefsServer)gefs.\(yyyymmdd)/\(hh)/atmos/pgrb2sp25/\(memberString).t\(hh)z.pgrb2s.0p25.f\(fHHH)"]
         case .gfs013:
             return ["\(useArchive ? gfsAws : gfsNomads)gfs.\(yyyymmdd)/\(hh)/atmos/gfs.t\(hh)z.sfluxgrbf\(fHHH).grib2"]
         case .gfs025:
-            return ["\(useArchive ? gfsAws : gfsNomads)gfs.\(yyyymmdd)/\(hh)/atmos/gfs.t\(hh)z.pgrb2.0p25.f\(fHHH)"]
+            let base = "\(useArchive ? gfsAws : gfsNomads)gfs.\(yyyymmdd)/\(hh)/atmos"
+            return ["\(base)/gfs.t\(hh)z.pgrb2.0p25.f\(fHHH)", "\(base)/gfs.t\(hh)z.pgrb2b.0p25.f\(fHHH)"]
         //case .nam_conus:
         //    return "https://nomads.ncep.noaa.gov/pub/data/nccf/com/nam/prod/nam.\(run.format_YYYYMMdd)/nam.t\(run.hh)z.conusnest.hiresf\(fHH).tm00.grib2"
         case .hrrr_conus:
-            let nomads = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/"
             //let google = "https://storage.googleapis.com/high-resolution-rapid-refresh/"
-            let aws = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/"
-            return ["\(useArchive ? aws : nomads)hrrr.\(yyyymmdd)/conus/hrrr.t\(hh)z.wrfprsf\(fHH).grib2"]
+            return ["\(hrrrServer)hrrr.\(yyyymmdd)/conus/hrrr.t\(hh)z.wrfprsf\(fHH).grib2"]
+        case .hrrr_conus_15min:
+            return ["\(hrrrServer)hrrr.\(yyyymmdd)/conus/hrrr.t\(hh)z.wrfsubhf\(fHH).grib2"]
         }
     }
 }
